@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Test awatara — trenerka jogi</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; background: #fafafa; color: #1a1a1a; }
+    h1 { font-size: 1.3rem; }
+    video { width: 100%; max-width: 480px; border-radius: 12px; background: #000; display: block; margin: 16px 0; }
+    button { padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; font-size: 1rem; margin-right: 8px; }
+    #start { background: #1a1a1a; color: #fff; }
+    #stop { background: #e5e5e5; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    #log, #provider-output, #database-log { margin-top: 16px; font-size: 0.85rem; background: #fff; border: 1px solid #e5e5e5; border-radius: 8px; padding: 12px; max-height: 260px; overflow-y: auto; white-space: pre-wrap; }
+    #provider-output, #database-log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #database-log { border-color: #b8d9c2; background: #f7fcf8; }
+    .hint { color: #666; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Test: rozmowa z trenerką jogi</h1>
+  <p class="hint">Wybierz dostawcę awatara, kliknij Start, pozwól na dostęp do mikrofonu i po prostu
+  zacznij mówić po polsku. Log poniżej zapisuje zdarzenia z timestampami — na ich podstawie ocenimy
+  czas reakcji.</p>
+
+  <video id="persona-video" autoplay playsinline></video>
+
+  <div>
+    <label for="provider">Dostawca:</label>
+    <select id="provider"></select>
+  </div>
+
+  <div>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+
+  <div id="log">— log zdarzeń —</div>
+  <div id="provider-output">— surowy output providerów (tokeny zamaskowane) —</div>
+  <div id="database-log">— monitor Session Recorder / Supabase —</div>
+
+  <script type="module">
+    import { createClient, AnamEvent } from "https://esm.sh/@anam-ai/js-sdk@latest";
+    import { Room, RoomEvent } from "https://esm.sh/livekit-client@2";
+    import Daily from "https://esm.sh/@daily-co/daily-js";
+
+    const startBtn = document.getElementById("start");
+    const stopBtn = document.getElementById("stop");
+    const providerSelect = document.getElementById("provider");
+    const logEl = document.getElementById("log");
+    const providerOutputEl = document.getElementById("provider-output");
+    const databaseLogEl = document.getElementById("database-log");
+    let activeProviderKey = null;
+
+    const t0 = () => new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+    function log(msg) {
+      logEl.textContent += `\n[${t0()}] ${msg}`;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(`[${t0()}] ${msg}`);
+    }
+
+    function sanitizeProviderOutput(value) {
+      const sensitiveKey = /(?:token|api[_-]?key|authorization|secret|password)/i;
+      const seen = new WeakSet();
+      const json = JSON.stringify(value, (key, current) => {
+        if (sensitiveKey.test(key)) return "[MASKED]";
+        if (typeof current === "object" && current !== null) {
+          if (seen.has(current)) return "[Circular]";
+          seen.add(current);
+        }
+        return current;
+      }, 2);
+      return json || String(value);
+    }
+
+    function logProviderOutput(provider, event, payload) {
+      const entry = `[${t0()}] ${provider} · ${event}\n${sanitizeProviderOutput(payload)}`;
+      providerOutputEl.textContent += `\n${entry}`;
+      providerOutputEl.scrollTop = providerOutputEl.scrollHeight;
+      console.debug(entry);
+    }
+
+    // Osobny, czytelny strumień dla recordera. Pokazuje request wysłany do
+    // backendu, zwrócony status i finalny rekord przekazywany do Supabase.
+    // Ta sama maska zabezpiecza przed przypadkowym wypisaniem tokenu/klucza.
+    function logDatabase(event, payload) {
+      const entry = `[${t0()}] ${event}\n${sanitizeProviderOutput(payload)}`;
+      databaseLogEl.textContent += `\n${entry}`;
+      databaseLogEl.scrollTop = databaseLogEl.scrollHeight;
+      console.debug(`[DATABASE] ${entry}`);
+    }
+
+    // ---- ADAPTERY DOSTAWCÓW ----
+    // Klucze muszą zgadzać się z kluczami PROVIDERS w server.js. Każdy adapter
+    // sam ogarnia swój sposób połączenia — connect(videoElId) i disconnect().
+    let anamClient = null;
+
+    // LiveAvatar (Full mode): sesja LiveKit, tak samo jak Anam — łączymy się
+    // do pokoju, publikujemy mikrofon, a HeyGen (LLM+STT+TTS+avatar) robi
+    // resztę po swojej stronie. Wpisy tekstowe idą przez data channel jako
+    // komenda "avatar.speak_response" (patrz docs.liveavatar.com/docs/command-events).
+    let liveavatarRoom = null;
+    let liveavatarVideoEl = null;
+    let liveavatarSessionId = null;
+    let liveavatarProviderKey = null;
+    let userSpeakEndedAt = null; // znacznik czasu do liczenia latencji odpowiedzi awatara
+
+    // Tavus: trzeci dostawca. Konwersacja to pokój Daily.co — łączymy się
+    // przez @daily-co/daily-js jako "call object" (headless, bez wbudowanego
+    // UI Daily) i sami podpinamy zdalne tracki pod <video>, dokładnie tak
+    // jak dla LiveKit wyżej.
+    let tavusCall = null;
+    let tavusVideoEl = null;
+    let tavusConversationId = null;
+    let tavusUserSpeakEndedAt = null;
+
+    // Anam: znacznik do tej samej miary latencji co LiveAvatar/Tavus. Anam
+    // nie ma osobnego eventu "persona zaczęła mówić" (audio) — najbliższy
+    // dostępny sygnał to pierwszy chunk MESSAGE_STREAM_EVENT_RECEIVED z
+    // role "persona", czyli moment startu generowania odpowiedzi (tekst),
+    // nie ściśle moment pierwszego dźwięku — w praktyce to i tak najlepsze
+    // przybliżenie bez wchodzenia w analizę samego audio.
+    let anamUserSpeakEndedAt = null;
+
+    function decodeDataMessage(payload) {
+      try {
+        return JSON.parse(new TextDecoder().decode(payload));
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function getProviderSession(provider) {
+      const res = await fetch("/api/session-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider }),
+      });
+      const raw = await res.text();
+      let data;
+      try { data = JSON.parse(raw); } catch (_) { data = { raw }; }
+      logProviderOutput(provider, `HTTP /api/session-token (${res.status})`, data);
+      if (!res.ok) throw new Error(`Serwer zwrócił ${res.status}: ${data.error || data.raw || JSON.stringify(data)}`);
+      return data;
+    }
+
+    // Sesje LiveAvatar i Tavus zostają formalnie "aktywne" po stronie
+    // dostawcy, dopóki jawnie ich nie zamkniemy (patrz endSession w
+    // server.js). Dla LiveAvatar czekamy również na odpowiedź recordera:
+    // wtedy kliknięcie Stop gwarantuje domknięcie sesji w storage zanim UI
+    // pozwoli rozpocząć następną.
+    async function endServerSession(provider, id) {
+      if (!id) return;
+      try {
+        if (provider === "liveavatar" || provider === "liveavatarGroq") {
+          logDatabase("→ session-end", { provider, sessionId: id, action: "stop LiveAvatar + finalny upsert" });
+        }
+        const res = await fetch("/api/session-end", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, id }),
+        });
+        const data = await res.json().catch(() => ({}));
+        logProviderOutput(provider, `HTTP /api/session-end (${res.status})`, data);
+        if (provider === "liveavatar" || provider === "liveavatarGroq") {
+          logDatabase(`← session-end · HTTP ${res.status}`, {
+            request: { provider, sessionId: id },
+            response: data,
+          });
+        }
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      } catch (e) {
+        log(`(Nie udało się zamknąć sesji po stronie serwera: ${e.message})`);
+      }
+    }
+
+    function recordLiveAvatarEvent(eventType, event = {}) {
+      if (!liveavatarProviderKey || !liveavatarSessionId) return;
+      const payload = {
+        provider: liveavatarProviderKey,
+        sessionId: liveavatarSessionId,
+        eventType,
+        event,
+      };
+      logDatabase(`→ session-record/event · ${eventType}`, payload);
+      fetch("/api/session-record/event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      })
+        .then(async (res) => {
+          const data = await res.json().catch(() => ({}));
+          logProviderOutput(liveavatarProviderKey, `Session Recorder · ${eventType} (${res.status})`, data);
+          logDatabase(`← session-record/event · HTTP ${res.status}`, {
+            eventType,
+            saved: data.saved,
+            storageStatus: data.storageStatus,
+            databaseStatus: data.databaseStatus,
+            response: data,
+          });
+        })
+        .catch((e) => {
+          log(`(Session Recorder: ${e.message})`);
+          logDatabase("✕ session-record/event · network error", { eventType, error: e.message });
+        });
+    }
+
+    const ADAPTERS = {
+      anam: {
+        async connect(videoElId) {
+          log("Pobieram session token (anam)...");
+          const { sessionToken } = await getProviderSession("anam");
+
+          log("Token OK. Łączę z awatarem...");
+          anamClient = createClient(sessionToken);
+          // Zdarzenia SDK — jeśli któreś nazwy nie istnieją w aktualnej wersji,
+          // po prostu się nie podepną; kluczowe logi i tak zobaczysz.
+          try {
+            anamClient.addListener(AnamEvent.CONNECTION_ESTABLISHED, () => log("Połączono."));
+            anamClient.addListener(AnamEvent.VIDEO_PLAY_STARTED, () => log("Wideo wystartowało."));
+            anamClient.addListener(AnamEvent.INPUT_AUDIO_STREAM_STARTED, () => log("Mikrofon aktywny."));
+            anamClient.addListener(AnamEvent.MESSAGE_HISTORY_UPDATED, (msgs) => {
+              logProviderOutput("anam", "MESSAGE_HISTORY_UPDATED", msgs);
+              const last = msgs[msgs.length - 1];
+              if (last) log(`${last.role === "user" ? "TY" : "AWATAR"}: ${last.content}`);
+            });
+            anamClient.addListener(AnamEvent.USER_SPEECH_STARTED, () => log("Zaczynasz mówić..."));
+            anamClient.addListener(AnamEvent.USER_SPEECH_ENDED, () => {
+              log("Skończyłeś mówić.");
+              anamUserSpeakEndedAt = performance.now();
+            });
+            anamClient.addListener(AnamEvent.MESSAGE_STREAM_EVENT_RECEIVED, (ev) => {
+              logProviderOutput("anam", "MESSAGE_STREAM_EVENT_RECEIVED", ev);
+              if (ev.role !== "persona" || anamUserSpeakEndedAt === null) return;
+              log("Awatar zaczyna odpowiadać...");
+              log(`LATENCJA ODPOWIEDZI: ${Math.round(performance.now() - anamUserSpeakEndedAt)} ms`);
+              anamUserSpeakEndedAt = null;
+            });
+          } catch (e) {
+            log("(Część listenerów niedostępna w tej wersji SDK — nie szkodzi.)");
+          }
+          await anamClient.streamToVideoElement(videoElId);
+          log("Streaming działa. Mów!");
+        },
+        disconnect() {
+          if (anamClient) anamClient.stopStreaming();
+          anamClient = null;
+        },
+      },
+
+      liveavatar: {
+        async connect(videoElId, providerKey = "liveavatar") {
+          liveavatarProviderKey = providerKey;
+          liveavatarVideoEl = document.getElementById(videoElId);
+          log(`Wideo: element #${videoElId} ${liveavatarVideoEl ? "znaleziony" : "NIE ZNALEZIONY!"}`);
+
+          log(`Pobieram session token (${providerKey})...`);
+          const session = await getProviderSession(providerKey);
+          const { livekitUrl, livekitToken, sessionId, recorder } = session;
+          liveavatarSessionId = sessionId;
+          logDatabase("✓ recorder session.started (serwer)", {
+            provider: providerKey,
+            sessionId,
+            recorder,
+          });
+
+          log("Token OK. Łączę z pokojem LiveKit...");
+          liveavatarRoom = new Room();
+
+          liveavatarRoom.on(RoomEvent.TrackSubscribed, (track) => {
+            log(`LiveKit: nowy track (${track.kind}) od awatara — podpinam do wideo.`);
+            track.attach(liveavatarVideoEl);
+          });
+          liveavatarRoom.on(RoomEvent.TrackUnsubscribed, (track) => {
+            track.detach(liveavatarVideoEl);
+          });
+          // track.attach() samo woła play() pod spodem — jeśli przeglądarka
+          // zablokuje autoplay dźwięku (NotAllowedError, częste gdy sesja
+          // WebRTC startuje z opóźnieniem po kliknięciu Start i "user
+          // gesture" już wygasł), LiveKit nie rzuca błędem w naszym kodzie,
+          // tylko cicho ustawia canPlaybackAudio=false. Bez tego listenera
+          // nie było ŻADNEGO śladu w logu, dlatego wyglądało to jak losowy
+          // brak dźwięku bez przyczyny.
+          liveavatarRoom.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+            if (liveavatarRoom.canPlaybackAudio) return;
+            log("⚠️ Przeglądarka zablokowała autoplay dźwięku. Kliknij gdziekolwiek na stronie, żeby go włączyć.");
+            const resume = () => {
+              liveavatarRoom.startAudio().then(() => log("Dźwięk włączony."));
+              document.removeEventListener("click", resume);
+            };
+            document.addEventListener("click", resume);
+          });
+          liveavatarRoom.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+            const msg = decodeDataMessage(payload);
+            logProviderOutput(providerKey, `LiveKit DataReceived · topic=${topic || "(brak)"}`, msg || {
+              undecodablePayloadBytes: payload.byteLength,
+            });
+            if (topic !== "agent-response") return;
+            if (!msg) return;
+            if (msg.event_type === "user.transcription") {
+              log(`TY: ${msg.text}`);
+              recordLiveAvatarEvent(msg.event_type, msg);
+            }
+            else if (msg.event_type === "avatar.transcription") {
+              log(`AWATAR: ${msg.text}`);
+              recordLiveAvatarEvent(msg.event_type, msg);
+            }
+            else if (msg.event_type === "user.speak_started") log("Zaczynasz mówić...");
+            else if (msg.event_type === "user.speak_ended") {
+              log("Skończyłeś mówić.");
+              userSpeakEndedAt = performance.now();
+            }
+            else if (msg.event_type === "avatar.speak_started") {
+              log("Awatar zaczyna mówić...");
+              if (userSpeakEndedAt !== null) {
+                log(`LATENCJA ODPOWIEDZI: ${Math.round(performance.now() - userSpeakEndedAt)} ms`);
+                userSpeakEndedAt = null;
+              }
+            }
+            else if (msg.event_type === "avatar.speak_ended") log("Awatar skończył mówić.");
+            else if (msg.event_type === "session.stopped") {
+              log(`LiveAvatar: sesja zakończona (${msg.end_reason || "brak powodu"}).`);
+              recordLiveAvatarEvent(msg.event_type, msg);
+            }
+            // resztę (np. *.transcription.chunk — strumień częściowego tekstu)
+            // ignorujemy, to tylko szum przy liczeniu latencji odpowiedzi
+          });
+          liveavatarRoom.on(RoomEvent.Disconnected, () => log("LiveKit: rozłączono."));
+
+          await liveavatarRoom.connect(livekitUrl, livekitToken);
+          log("Połączono z pokojem. Włączam mikrofon...");
+          await liveavatarRoom.localParticipant.setMicrophoneEnabled(true);
+          log("Mikrofon aktywny. Mów!");
+        },
+        async disconnect() {
+          if (liveavatarRoom) {
+            liveavatarRoom.disconnect();
+            liveavatarRoom = null;
+          }
+          if (liveavatarVideoEl) {
+            liveavatarVideoEl.pause();
+            liveavatarVideoEl.removeAttribute("src");
+          }
+          await endServerSession(liveavatarProviderKey, liveavatarSessionId);
+          liveavatarSessionId = null;
+          liveavatarProviderKey = null;
+        },
+      },
+
+      // Ten adapter używa tej samej oficjalnej warstwy LiveKit co istniejący
+      // LiveAvatar Full. Różnica jest po stronie sesji: serwer wybiera Groq
+      // jako OpenAI-compatible Custom LLM; STT/TTS pozostają w LiveAvatar.
+      liveavatarGroq: {
+        connect(videoElId) {
+          return ADAPTERS.liveavatar.connect(videoElId, "liveavatarGroq");
+        },
+        async disconnect() {
+          return ADAPTERS.liveavatar.disconnect();
+        },
+      },
+
+      tavus: {
+        async connect(videoElId) {
+          tavusVideoEl = document.getElementById(videoElId);
+          log(`Wideo: element #${videoElId} ${tavusVideoEl ? "znaleziony" : "NIE ZNALEZIONY!"}`);
+
+          log("Tworzę konwersację (tavus)...");
+          const { conversationUrl, conversationId } = await getProviderSession("tavus");
+          tavusConversationId = conversationId;
+
+          log(`Konwersacja utworzona. Łączę z pokojem Daily (${conversationUrl})...`);
+          // startVideoOff: nie publikujemy własnej kamery, tylko mikrofon —
+          // avatar nie musi widzieć użytkownika, tylko go słyszeć.
+          tavusCall = Daily.createCallObject({
+            url: conversationUrl,
+            startVideoOff: true,
+            startAudioOff: false,
+          });
+
+          const remoteStreams = new Map();
+          tavusCall.on("track-started", (ev) => {
+            if (!ev.participant || ev.participant.local) return;
+            const id = ev.participant.session_id;
+            let stream = remoteStreams.get(id);
+            if (!stream) {
+              stream = new MediaStream();
+              remoteStreams.set(id, stream);
+              tavusVideoEl.srcObject = stream;
+            }
+            stream.addTrack(ev.track);
+            log(`Daily: nowy track (${ev.track.kind}) od awatara — podpinam do wideo.`);
+            // W przeciwieństwie do LiveKit (patrz adapter liveavatar), tu sami
+            // ustawiamy srcObject bez wywołania play() — poleganie na samym
+            // atrybucie autoplay nie daje żadnego sygnału błędu, jeśli
+            // przeglądarka zablokuje dźwięk (NotAllowedError). Wołamy play()
+            // jawnie, żeby to wyłapać i dać możliwość ręcznego wznowienia.
+            tavusVideoEl.play().catch((e) => {
+              if (e.name !== "NotAllowedError") return;
+              log("⚠️ Przeglądarka zablokowała autoplay dźwięku. Kliknij gdziekolwiek na stronie, żeby go włączyć.");
+              const resume = () => {
+                tavusVideoEl.play().then(() => log("Dźwięk włączony."));
+                document.removeEventListener("click", resume);
+              };
+              document.addEventListener("click", resume);
+            });
+          });
+          tavusCall.on("left-meeting", () => log("Daily: opuszczono spotkanie."));
+          tavusCall.on("error", (ev) => log(`(Daily błąd: ${ev?.errorMsg || JSON.stringify(ev)})`));
+          // Zdarzenia rozmowy (transkrypcja, kto mówi) Tavus wysyła przez
+          // data channel Daily jako "app-message" — payload bywa albo samym
+          // eventem Tavusa, albo owinięty w { data: ... }, stąd fallback.
+          tavusCall.on("app-message", (raw) => {
+            logProviderOutput("tavus", "Daily app-message", raw);
+            const msg = raw?.data ?? raw;
+            if (!msg?.event_type) return;
+            if (msg.event_type === "conversation.user.started_speaking") log("Zaczynasz mówić...");
+            else if (msg.event_type === "conversation.user.stopped_speaking") {
+              log("Skończyłeś mówić.");
+              tavusUserSpeakEndedAt = performance.now();
+            } else if (msg.event_type === "conversation.replica.started_speaking") {
+              log("Awatar zaczyna mówić...");
+              if (tavusUserSpeakEndedAt !== null) {
+                log(`LATENCJA ODPOWIEDZI: ${Math.round(performance.now() - tavusUserSpeakEndedAt)} ms`);
+                tavusUserSpeakEndedAt = null;
+              }
+            } else if (msg.event_type === "conversation.replica.stopped_speaking") log("Awatar skończył mówić.");
+            else if (msg.event_type === "conversation.utterance") {
+              const text = msg.properties?.speech || msg.properties?.text;
+              if (text) log(`${msg.properties?.role === "user" ? "TY" : "AWATAR"}: ${text}`);
+            }
+          });
+
+          await tavusCall.join();
+          log("Połączono. Mów!");
+        },
+        disconnect() {
+          if (tavusCall) {
+            tavusCall.leave();
+            tavusCall.destroy();
+            tavusCall = null;
+          }
+          if (tavusVideoEl) {
+            tavusVideoEl.pause();
+            tavusVideoEl.removeAttribute("src");
+            tavusVideoEl.srcObject = null;
+          }
+          endServerSession("tavus", tavusConversationId);
+          tavusConversationId = null;
+        },
+      },
+    };
+
+    async function loadProviders() {
+      const res = await fetch("/api/providers");
+      const { providers } = await res.json();
+      providerSelect.innerHTML = "";
+      providers.forEach(({ key, label }) => {
+        const opt = document.createElement("option");
+        opt.value = key;
+        opt.textContent = label;
+        providerSelect.appendChild(opt);
+      });
+      const saved = localStorage.getItem("avatarProvider");
+      if (saved && providers.some((p) => p.key === saved)) providerSelect.value = saved;
+    }
+    loadProviders();
+
+    startBtn.onclick = async () => {
+      startBtn.disabled = true;
+      const providerKey = providerSelect.value;
+      localStorage.setItem("avatarProvider", providerKey);
+      try {
+        await ADAPTERS[providerKey].connect("persona-video");
+        activeProviderKey = providerKey;
+        providerSelect.disabled = true;
+        stopBtn.disabled = false;
+      } catch (e) {
+        // connect() może utworzyć sesję zanim później wystąpi błąd (np. przy
+        // mikrofonie). Sprzątnij ją tym samym adapterem, aby nie blokowała
+        // limitu współbieżności przy kolejnym Starcie.
+        try { await ADAPTERS[providerKey].disconnect(); } catch (_) {}
+        log(`BŁĄD: ${e.message}`);
+        startBtn.disabled = false;
+      }
+    };
+
+    stopBtn.onclick = async () => {
+      stopBtn.disabled = true;
+      if (activeProviderKey) await ADAPTERS[activeProviderKey].disconnect();
+      activeProviderKey = null;
+      providerSelect.disabled = false;
+      log("Zatrzymano.");
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    };
+  </script>
+</body>
+</html>
