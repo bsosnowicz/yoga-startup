@@ -1,6 +1,6 @@
 # LiveAvatar FULL — Session Recorder
 
-Uruchom serwer Node 18+:
+Uruchom serwer Node 18+ (adapter **LiveAvatar Lite + ElevenLabs** wymaga Node 22+ — patrz niżej):
 
 ```bash
 cp .env.example .env
@@ -123,16 +123,10 @@ ucho/tułów, 0.2 biodro/kolano, 0.25 pięta/czubek stopy) — do skalibrowania
 patrząc na realne nagranie testera w kamerze (patrz tekstowy odczyt na
 podglądzie kamery), nie sztywne liczby z podręcznika.
 
-Co trzeba dopiąć, przenosząc pracę z drugiego komputera (LiveAvatar + Groq +
-Supabase + głos ElevenLabs):
+Co trzeba dopiąć:
 - Wciągnięcie pamięci usera (`memory.js`/`loadMemoryContext`) do promptu
   korekty/pochwały — np. nie dociskać korekty, jeśli user wcześniej zgłosił
   ból. Baza już istnieje, brakuje tylko podpięcia.
-- Jeśli tamta integracja to faktycznie LiveAvatar **LITE mode** (BYO
-  ASR/TTS/wideo), a nie FULL + Custom TTS — LITE komunikuje się osobnym
-  WebSocketem (`docs.liveavatar.com/docs/lite-mode/events.md`), nie tym samym
-  kanałem LiveKit co FULL. Wtedy trzeba dopisać wariant wysyłki po
-  WebSocket; `posture.js`, `pose-detector.js` i endpointy zostają bez zmian.
 - Powrót `cat_cow` (albo kolejnych ćwiczeń) wymaga najpierw własnych reguł
   geometrycznych w `pose-detector.js` — samo dopisanie do `posture.js` nie
   wystarczy (auto-detekcja z rozmowy zadziała, ale reguły — nie).
@@ -142,7 +136,51 @@ Supabase + głos ElevenLabs):
   ("docs.liveavatar.com/docs/command-events") już nie istnieje, strona się przeniosła.
   Model MediaPipe: `developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker`.
 
+**Korekta postawy działa też na LiveAvatar LITE mode** (patrz sekcja niżej),
+nie tylko na FULL/Groq: LITE komunikuje się osobnym WebSocketem
+(`docs.liveavatar.com/docs/lite-mode/events.md`), bez natywnego TTS po stronie
+LiveAvatar — jedyna droga to gotowe audio PCM 16-bit/24kHz przez `agent.speak`.
+`speakLiteCue()` w `server.js` generuje to audio przez ElevenLabs (ten sam
+pipeline co zwykła rozmowa w `runLiteTurn`, tylko bez strumieniowania z Groq —
+tekst korekty jest już gotowy) i wysyła je do `ws_url` tej sesji.
+`/api/posture-correction`/`/api/posture-affirmation` przyjmują opcjonalny
+`sessionId` — gdy pasuje do aktywnej sesji Lite, wygłaszają korektę tam,
+zamiast (albo obok) zwrócenia samego tekstu do przeglądarki. `posture.js` i
+`pose-detector.js` zostały bez zmian, zgodnie z założeniem.
+
 Uwaga przy okazji: ten plik referencyjnie wspomina wyżej `node test-memory.js`
 oraz migracje w `supabase/migrations/`, ale w tym repo `test-memory.js` w
 ogóle nie istnieje (nigdy nie trafił do gita), a `supabase/` jest
 gitignorowane — prawdopodobnie też zostały na innym komputerze.
+
+## LiveAvatar Lite + ElevenLabs (własny STT/LLM/TTS)
+
+Czwarty dostawca w dropdownie. W przeciwieństwie do pozostałych trzech (Full mode — LiveAvatar sam ogarnia LLM+TTS) tu LiveAvatar **tylko renderuje twarz**; STT, LLM i TTS są w całości po naszej stronie:
+
+```
+mikrofon (Web Speech API, pl-PL) --> Groq LLM (llama-3.3-70b, streaming)
+  --> ElevenLabs TTS (streaming, PCM 24kHz, Twój sklonowany głos)
+  --> ws_url LiveAvatar (agent.speak) --> twarz awatara
+```
+
+### Wymagania
+
+- **Node 22+** do uruchomienia `server.js`, kiedy ten adapter ma działać — Lite łączy się z `ws_url` (LiveAvatar) i ze streamingiem ElevenLabs przez natywny, globalny `WebSocket`, którego Node 18 (dotychczasowe minimum tego projektu) nie ma. Pozostałe trzy adaptery nie używają WebSocket po stronie serwera i działają identycznie na 18 i 22 — podniesienie wymagania dotyczy praktycznie tylko tego, że to jeden proces. Najprościej przez [nvm](https://github.com/nvm-sh/nvm): `nvm install 22 && nvm use 22`.
+- W `.env`, oprócz istniejących zmiennych: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` (id Twojego sklonowanego głosu w ElevenLabs). Opcjonalnie `ELEVENLABS_MODEL_ID` (domyślnie `eleven_flash_v2_5` — model zoptymalizowany pod latencję, wspiera polski).
+- Klucz ElevenLabs nigdy nie trafia do przeglądarki — całe wywołanie streamingu TTS dzieje się na serwerze, tak jak `GROQ_API_KEY` już wcześniej.
+
+### Jak to działa
+
+- Sesja startuje tak samo jak Full mode (`/sessions/token` z `mode:"LITE"` → `/sessions/start`), ale zamiast LiveKit data channel dostajemy dodatkowo `ws_url` — osobny WebSocket do sterowania awatarem (`agent.speak`, `agent.speak_end`, `agent.start_listening`/`agent.stop_listening`, `session.keep_alive`). Przeglądarka łączy się z LiveKit **tylko po wideo**, bez publikowania mikrofonu.
+- Transkrypcję robi Web Speech API w przeglądarce (wybrane zamiast Groq Whisper — niższa latencja i prostszy kod, patrz komentarz przy adapterze w `public/index.html`); finalny tekst leci do `POST /api/lite-turn`.
+- Backend strumieniuje odpowiedź Groq zdanie po zdaniu do ElevenLabs (`stream-input` WebSocket, `output_format=pcm_24000` — dokładnie format wymagany przez LiveAvatar Lite, zero resamplingu) i przekazuje przychodzące audio do `ws_url` w kawałkach (pierwszy ~600ms, kolejne ~1s), więc awatar zaczyna mówić, zanim LLM skończy całą odpowiedź.
+- Postęp per ogniwo (STT gotowe / pierwszy token LLM / pierwszy chunk TTS / awatar zaczyna mówić) leci do przeglądarki przez `GET /api/lite-events` (Server-Sent Events) i loguje się tym samym formatem `LATENCJA ODPOWIEDZI: X ms`, co pozostałe adaptery — wyniki są bezpośrednio porównywalne.
+- Session Recorder i pamięć (Supabase) działają przez ten sam mechanizm co pozostałe adaptery LiveAvatar — bez osobnej ścieżki: backend sam woła `recordLiveAvatarEvent()` dla `user.transcription`/`avatar.transcription` (ma ten tekst od razu, bez przekazywania przez przeglądarkę), a zamknięcie sesji robi ten sam upsert do `avatar_sessions` i tę samą ekstrakcję pamięci przez Groq.
+- Zamykanie sesji Lite różni się od Full: dokumentacja HeyGena podaje `DELETE /v1/sessions`, co w testach zwracało 405. Działający sposób (zweryfikowany bezpośrednio) to `POST /v1/sessions/stop` z `Authorization: Bearer <session_token>` (nie `X-API-KEY` jak w Full mode) — tak zaimplementowano `endSession()` tego adaptera.
+- Barge-in (przerywanie awatara w trakcie mówienia) działa: przeglądarka wykrywa nową mowę usera podczas `liteAvatarSpeaking` (z buforem ~600ms po starcie mówienia awatara, żeby resztkowy wynik rozpoznawania własnej, dopiero co wysłanej wypowiedzi nie przerywał sam siebie) i woła `POST /api/lite-interrupt`, który przerywa Groq (`AbortController`) oraz LiveAvatar (`agent.interrupt`).
+- Korekta/pochwała postawy (patrz sekcja "Sprint 2" wyżej) działa też tutaj: `speakLiteCue()` w `server.js` generuje audio przez ElevenLabs z gotowego tekstu (bez Groq) i wysyła je tym samym `ws_url` co zwykła rozmowa.
+
+### Znane ograniczenia
+
+- Web Speech API działa tylko w przeglądarkach opartych o Chromium (Chrome/Edge) — tak jak reszta aplikacji już zakłada dla WebRTC/LiveKit.
+- Historia rozmowy trzymana w pamięci procesu (do 4 ostatnich wymian), nie w Supabase — ograniczenie kontekstu Groq w ramach jednej żywej sesji, niezależne od `user_memory`/`session_memory`.

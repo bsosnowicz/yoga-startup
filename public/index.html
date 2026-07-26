@@ -38,7 +38,7 @@
   </div>
 
   <fieldset>
-    <legend>Korekta postawy na żywo (tylko LiveAvatar Full/Groq, aktywna sesja)</legend>
+    <legend>Korekta postawy na żywo (LiveAvatar Full/Groq/Lite, aktywna sesja)</legend>
     <p class="hint">Ćwiczenie wykrywane jest automatycznie z rozmowy (co powie avatar albo Ty) —
     nie trzeba nic wybierać ręcznie. Kamera włącza się wyłącznie po kliknięciu.</p>
     <p id="active-exercise-status" class="hint"><strong>Wykryte ćwiczenie:</strong> brak — czekam, aż zostanie przydzielone w rozmowie.</p>
@@ -160,6 +160,20 @@
     // przybliżenie bez wchodzenia w analizę samego audio.
     let anamUserSpeakEndedAt = null;
 
+    // LiveAvatar Lite + ElevenLabs: pipeline (STT/LLM/TTS) jest po stronie
+    // serwera, tu tylko wideo (LiveKit, bez mikrofonu) + Web Speech API do
+    // STT + SSE do odbioru statusu/latency z backendu.
+    let liteRoom = null;
+    let liteSessionId = null;
+    let liteEventSource = null;
+    let liteRecognition = null;
+    let liteRecognitionActive = false;
+    let liteUserSpeakEndedAt = null;
+    let liteSpeechWatchdog = null;
+    let liteAvatarSpeaking = false;
+    let liteAvatarSpeakingStartedAt = 0;
+    let liteSpeechEndedAt = null;
+
     function decodeDataMessage(payload) {
       try {
         return JSON.parse(new TextDecoder().decode(payload));
@@ -194,7 +208,7 @@
     async function endServerSession(provider, id) {
       if (!id) return;
       try {
-        if (provider === "liveavatar" || provider === "liveavatarGroq") {
+        if (provider === "liveavatar" || provider === "liveavatarGroq" || provider === "liveavatarLiteEleven") {
           logDatabase("→ session-end", { provider, sessionId: id, action: "stop LiveAvatar + finalny upsert" });
         }
         const res = await fetch("/api/session-end", {
@@ -204,7 +218,7 @@
         });
         const data = await res.json().catch(() => ({}));
         logProviderOutput(provider, `HTTP /api/session-end (${res.status})`, data);
-        if (provider === "liveavatar" || provider === "liveavatarGroq") {
+        if (provider === "liveavatar" || provider === "liveavatarGroq" || provider === "liveavatarLiteEleven") {
           logDatabase(`← session-end · HTTP ${res.status}`, {
             request: { provider, sessionId: id },
             response: data,
@@ -247,60 +261,71 @@
         });
     }
 
-    // Szkielet live-korekty postawy: dziś exercise/deviation przychodzą z
-    // ręcznie wybranych dropdownów w panelu debug, docelowo z prawdziwej
-    // detekcji pozy (kamera + landmarki). Wysyłka działa tylko dla FULL-mode
-    // providerów LiveAvatar, które współdzielą liveavatarRoom (patrz komentarz
-    // przy PROVIDERS w server.js — topic "agent-control", avatar.speak_text
-    // vs avatar.speak_response, avatar.interrupt).
+    // Szkielet live-korekty postawy: exercise/deviation przychodzą z prawdziwej
+    // detekcji pozy (kamera + landmarki). Doręczenie do awatara ma dwie ścieżki,
+    // zależnie od providera aktywnej sesji:
+    // - FULL mode (liveavatarRoom): tekst leci przez LiveKit data channel jako
+    //   komenda "avatar.speak_text"/"avatar.interrupt" (topic "agent-control",
+    //   patrz komentarz przy PROVIDERS w server.js) — avatar ma własne TTS.
+    // - LITE mode (liteSessionId): LiveAvatar nie ma tam własnego TTS (patrz
+    //   docs.liveavatar.com/docs/lite-mode/events.md — tylko gotowe audio PCM
+    //   przez agent.speak), więc przeglądarka nie publikuje nic sama — serwer
+    //   (speakLiteCue() w server.js) generuje audio przez ElevenLabs i wysyła
+    //   je do ws_url TEJ sesji, gdy dostanie sessionId w body poniżej.
     async function sendPostureCue(exercise, deviation, { interrupt = true } = {}) {
-      if (!liveavatarRoom) {
-        log("Korekta postawy działa tylko przy aktywnej sesji LiveAvatar Full/Groq.");
+      if (!liveavatarRoom && !liteSessionId) {
+        log("Korekta postawy działa tylko przy aktywnej sesji LiveAvatar (Full/Groq/Lite).");
         return;
       }
       const res = await fetch("/api/posture-correction", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ exercise, deviation }),
+        body: JSON.stringify({ exercise, deviation, sessionId: liteSessionId }),
       });
       const data = await res.json().catch(() => ({}));
-      logProviderOutput(liveavatarProviderKey, `HTTP /api/posture-correction (${res.status})`, data);
+      logProviderOutput(liveavatarProviderKey || "liveavatarLiteEleven", `HTTP /api/posture-correction (${res.status})`, data);
       if (!res.ok) {
         log(`BŁĄD korekty postawy: ${data.error || res.status}`);
         return;
       }
-      if (interrupt) {
+      if (liveavatarRoom) {
+        if (interrupt) {
+          await liveavatarRoom.localParticipant.publishData(
+            encodeDataMessage({ event_type: "avatar.interrupt" }),
+            { reliable: true, topic: "agent-control" }
+          );
+        }
         await liveavatarRoom.localParticipant.publishData(
-          encodeDataMessage({ event_type: "avatar.interrupt" }),
+          encodeDataMessage({ event_type: "avatar.speak_text", text: data.text }),
           { reliable: true, topic: "agent-control" }
         );
       }
-      await liveavatarRoom.localParticipant.publishData(
-        encodeDataMessage({ event_type: "avatar.speak_text", text: data.text }),
-        { reliable: true, topic: "agent-control" }
-      );
+      // Dla Lite serwer już wysłał audio (patrz sessionId w body wyżej) —
+      // tu tylko log, bez dodatkowego wywołania sieciowego.
       log(`KOREKTA POSTAWY [źródło: ${data.source || "?"}] wysłana: "${data.text}"`);
     }
 
     // Symetryczne do sendPostureCue — pochwała zamiast korekty. Domyślnie nie
     // przerywa bieżącej wypowiedzi (to nie jest pilne, w przeciwieństwie do korekty).
     async function sendPostureAffirmation(exercise) {
-      if (!liveavatarRoom) return;
+      if (!liveavatarRoom && !liteSessionId) return;
       const res = await fetch("/api/posture-affirmation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ exercise }),
+        body: JSON.stringify({ exercise, sessionId: liteSessionId }),
       });
       const data = await res.json().catch(() => ({}));
-      logProviderOutput(liveavatarProviderKey, `HTTP /api/posture-affirmation (${res.status})`, data);
+      logProviderOutput(liveavatarProviderKey || "liveavatarLiteEleven", `HTTP /api/posture-affirmation (${res.status})`, data);
       if (!res.ok) {
         log(`BŁĄD pochwały postawy: ${data.error || res.status}`);
         return;
       }
-      await liveavatarRoom.localParticipant.publishData(
-        encodeDataMessage({ event_type: "avatar.speak_text", text: data.text }),
-        { reliable: true, topic: "agent-control" }
-      );
+      if (liveavatarRoom) {
+        await liveavatarRoom.localParticipant.publishData(
+          encodeDataMessage({ event_type: "avatar.speak_text", text: data.text }),
+          { reliable: true, topic: "agent-control" }
+        );
+      }
       log(`POCHWAŁA POSTAWY [źródło: ${data.source || "?"}] wysłana: "${data.text}"`);
     }
 
@@ -561,6 +586,190 @@
           }
           endServerSession("tavus", tavusConversationId);
           tavusConversationId = null;
+        },
+      },
+
+      // LiveAvatar Lite + ElevenLabs: cały pipeline (STT/LLM/TTS) jest po
+      // stronie serwera (patrz PROVIDERS.liveavatarLiteEleven w server.js).
+      // Tu robimy tylko dwie rzeczy: (1) dołączamy do pokoju LiveKit
+      // WYŁĄCZNIE po wideo (avatar renderowany z audio, którym sterujemy
+      // przez backend — bez publikowania własnego mikrofonu, w
+      // przeciwieństwie do adaptera "liveavatar" wyżej), (2) rozpoznajemy
+      // mowę lokalnie (Web Speech API) i wysyłamy gotowy transkrypt do
+      // backendu, który odpala Groq -> ElevenLabs -> ws_url.
+      liveavatarLiteEleven: {
+        async connect(videoElId) {
+          const videoEl = document.getElementById(videoElId);
+          log(`Wideo: element #${videoElId} ${videoEl ? "znaleziony" : "NIE ZNALEZIONY!"}`);
+
+          log("Pobieram session token (liveavatarLiteEleven)...");
+          const session = await getProviderSession("liveavatarLiteEleven");
+          const { livekitUrl, livekitToken, sessionId, recorder } = session;
+          liteSessionId = sessionId;
+          logDatabase("✓ recorder session.started (serwer)", { provider: "liveavatarLiteEleven", sessionId, recorder });
+
+          log("Token OK. Łączę z pokojem LiveKit (tylko wideo, bez publikowania mikrofonu)...");
+          liteRoom = new Room();
+          liteRoom.on(RoomEvent.TrackSubscribed, (track) => {
+            log(`LiveKit: nowy track (${track.kind}) od awatara — podpinam do wideo.`);
+            track.attach(videoEl);
+          });
+          liteRoom.on(RoomEvent.TrackUnsubscribed, (track) => track.detach(videoEl));
+          liteRoom.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+            if (liteRoom.canPlaybackAudio) return;
+            log("⚠️ Przeglądarka zablokowała autoplay dźwięku. Kliknij gdziekolwiek na stronie, żeby go włączyć.");
+            const resume = () => {
+              liteRoom.startAudio().then(() => log("Dźwięk włączony."));
+              document.removeEventListener("click", resume);
+            };
+            document.addEventListener("click", resume);
+          });
+          liteRoom.on(RoomEvent.Disconnected, () => log("LiveKit: rozłączono."));
+          await liteRoom.connect(livekitUrl, livekitToken);
+          log("Połączono z pokojem (wideo).");
+
+          // Postęp pipeline'u (STT gotowe / pierwszy token LLM / pierwszy
+          // chunk TTS / awatar zaczyna mówić) przychodzi z backendu przez
+          // SSE — jeden trwały strumień na całą sesję, otwierany raz tutaj.
+          liteEventSource = new EventSource(`/api/lite-events?sessionId=${encodeURIComponent(sessionId)}`);
+          liteEventSource.onmessage = (ev) => {
+            let data;
+            try { data = JSON.parse(ev.data); } catch (_) { return; }
+            logProviderOutput("liveavatarLiteEleven", `SSE ${data.stage}`, data);
+            if (data.stage === "stt_ready") log(`  ↳ STT gotowe: ${data.ms} ms`);
+            else if (data.stage === "llm_first_token") log(`  ↳ LLM pierwszy token: ${data.ms} ms`);
+            else if (data.stage === "tts_first_chunk") log(`  ↳ TTS pierwszy chunk (od ElevenLabs): ${data.ms} ms`);
+            else if (data.stage === "audio_sent_to_avatar") log(`  ↳ Audio wysłane do LiveAvatar: ${data.ms} ms`);
+            else if (data.stage === "avatar_speak_started") {
+              liteAvatarSpeaking = true;
+              liteAvatarSpeakingStartedAt = performance.now();
+              // ms tutaj jest liczony na tym samym zegarze (backend,
+              // session.turnStartedAt) co "Audio wysłane do LiveAvatar" —
+              // różnica tych dwóch liczb to dokładny narzut samego
+              // LiveAvatar (sieć + render), bez domieszki front-end/STT.
+              log(`Awatar zaczyna mówić... (backend: ${data.ms} ms od startu tury)`);
+              if (liteUserSpeakEndedAt !== null) {
+                log(`LATENCJA ODPOWIEDZI: ${Math.round(performance.now() - liteUserSpeakEndedAt)} ms`);
+                liteUserSpeakEndedAt = null;
+              }
+            } else if (data.stage === "avatar_speak_ended") { liteAvatarSpeaking = false; log("Awatar skończył mówić."); }
+            else if (data.stage === "interrupted") { liteAvatarSpeaking = false; log("(Przerwano wypowiedź awatara.)"); }
+            else if (data.stage === "error") { liteAvatarSpeaking = false; log(`(Pipeline Lite: ${data.message})`); }
+            // Jedyne źródło treści odpowiedzi awatara w Lite mode (FULL mode
+            // dostaje to przez LiveKit data channel, patrz DataReceived wyżej)
+            // — potrzebne, żeby auto-detekcja ćwiczenia widziała też, co mówi
+            // avatar, nie tylko usera.
+            else if (data.stage === "avatar_transcription") {
+              log(`AWATAR: ${data.text}`);
+              detectActiveExercise(data.text);
+            }
+          };
+          liteEventSource.onerror = () => log("(SSE: połączenie ze statusem pipeline'u przerwane — spróbuje wznowić automatycznie)");
+
+          // STT: Web Speech API (natywne w przeglądarce, ciągłe
+          // rozpoznawanie pl-PL) zamiast Groq Whisper. Wybór ze względu na
+          // latencję i prostotę: Web Speech rozpoznaje mowę na bieżąco i
+          // zwraca finalny transkrypt niemal od razu po tym, jak użytkownik
+          // przestanie mówić — bez dodatkowego kroku nagraj-całość ->
+          // wyślij -> transkrybuj, który wymagałby Groq Whisper (endpoint
+          // /audio/transcriptions przyjmuje cały plik, nie strumień, więc
+          // dokładałby pełny czas nagrania + upload + inferencję zamiast
+          // ciągłego rozpoznawania). Jakość polskiego w Chrome (silnik
+          // Google) jest w praktyce bardzo dobra dla krótkich, potocznych
+          // wypowiedzi — dokładnie ten przypadek. Koszt: działa tylko w
+          // przeglądarkach opartych o Chromium (Chrome/Edge), tak jak reszta
+          // tej apki już zakłada dla WebRTC.
+          const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SpeechRecognitionImpl) throw new Error("Ta przeglądarka nie wspiera Web Speech API (użyj Chrome lub Edge).");
+          liteRecognition = new SpeechRecognitionImpl();
+          liteRecognition.lang = "pl-PL";
+          liteRecognition.continuous = true;
+          liteRecognition.interimResults = true;
+          liteRecognition.onspeechstart = () => { clearTimeout(liteSpeechWatchdog); log("Zaczynasz mówić..."); };
+          // onspeechend (cisza wykryta) != onresult/isFinal (tekst gotowy) —
+          // między nimi jest narzut samego silnika STT, którego reszta
+          // pipeline'u nie widzi. Liczymy LATENCJA ODPOWIEDZI od onspeechend
+          // (odpowiednik "user.speak_ended" u innych dostawców), nie od
+          // onresult, żeby liczba była uczciwa i porównywalna z resztą.
+          liteRecognition.onspeechend = () => { liteSpeechEndedAt = performance.now(); };
+          liteRecognition.onresult = (ev) => {
+            clearTimeout(liteSpeechWatchdog);
+            // Barge-in: sprawdzamy na KAŻDYM wyniku (nawet cząstkowym), nie
+            // tylko w onspeechstart — w trybie continuous Chrome odpala
+            // onspeechstart tylko raz dla pierwszej wypowiedzi w całej
+            // sesji rozpoznawania, nie dla każdej kolejnej (zweryfikowane
+            // na żywo: drugie i kolejne przerwania w ogóle nie działały).
+            // onresult, w tym wyniki cząstkowe, odpala się niezawodnie za
+            // każdym razem, gdy user zaczyna mówić. Bufor 600ms po starcie
+            // mówienia awatara: zweryfikowane na żywo, że bez tego resztkowy
+            // wynik rozpoznawania z WŁASNEJ, dopiero co wysłanej wypowiedzi
+            // potrafił natychmiast przerwać nową odpowiedź awatara (kilka
+            // przerwań z rzędu w ułamku sekundy po starcie).
+            if (liteAvatarSpeaking && performance.now() - liteAvatarSpeakingStartedAt > 600) {
+              liteAvatarSpeaking = false;
+              log("(Przerywasz awatara...)");
+              fetch("/api/lite-interrupt", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sessionId }),
+              }).catch((e) => log(`(Nie udało się przerwać: ${e.message})`));
+            }
+            const result = ev.results[ev.results.length - 1];
+            if (!result.isFinal) return;
+            const text = result[0].transcript.trim();
+            if (!text) return;
+            log(`TY: ${text}`);
+            detectActiveExercise(text);
+            if (liteSpeechEndedAt !== null) {
+              log(`  ↳ narzut STT (cisza → tekst gotowy): ${Math.round(performance.now() - liteSpeechEndedAt)} ms`);
+              liteUserSpeakEndedAt = liteSpeechEndedAt;
+              liteSpeechEndedAt = null;
+            } else {
+              liteUserSpeakEndedAt = performance.now(); // brak onspeechend (rzadkie) — fallback jak wcześniej
+            }
+            logDatabase("→ lite-turn", { sessionId, text });
+            fetch("/api/lite-turn", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ sessionId, text }),
+            })
+              .then(async (r) => {
+                const d = await r.json().catch(() => ({}));
+                logProviderOutput("liveavatarLiteEleven", `HTTP /api/lite-turn (${r.status})`, d);
+                if (!r.ok) log(`(Backend odrzucił turę: HTTP ${r.status} — ${d.error || "brak szczegółów"})`);
+              })
+              .catch((e) => log(`(Nie udało się wysłać tury: ${e.message})`));
+          };
+          liteRecognition.onerror = (ev) => { clearTimeout(liteSpeechWatchdog); log(`(Web Speech API: ${ev.error})`); };
+          // Chrome ubija ciągłe rozpoznawanie po dłuższej ciszy — wznawiamy
+          // automatycznie, dopóki sesja jest aktywna.
+          liteRecognition.onend = () => { if (liteRecognitionActive) liteRecognition.start(); };
+          liteRecognitionActive = true;
+          liteRecognition.start();
+          log("Mikrofon (Web Speech) aktywny. Mów!");
+          // Web Speech API bywa cichym punktem awarii: obiekt SpeechRecognition
+          // istnieje w wielu przeglądarkach opartych o Chromium (np. Opera),
+          // ale samo rozpoznawanie działa naprawdę tylko tam, gdzie przeglądarka
+          // ma dostęp do zamkniętego serwisu (Chrome, Edge) — bez błędu i bez
+          // żadnego eventu. Ten watchdog to wykrywa zamiast ciszy w logu.
+          clearTimeout(liteSpeechWatchdog);
+          liteSpeechWatchdog = setTimeout(() => {
+            log("⚠️ Rozpoznawanie mowy wystartowało, ale po 8s nie wykryło żadnej mowy ani błędu. Ta przeglądarka (np. Opera/Opera GX) może nie wspierać Web Speech API — spróbuj w Google Chrome lub Microsoft Edge.");
+          }, 8000);
+        },
+        async disconnect() {
+          liteRecognitionActive = false;
+          liteAvatarSpeaking = false;
+          liteSpeechEndedAt = null;
+          clearTimeout(liteSpeechWatchdog);
+          if (liteRecognition) { try { liteRecognition.stop(); } catch (_) {} liteRecognition = null; }
+          if (liteEventSource) { liteEventSource.close(); liteEventSource = null; }
+          if (liteRoom) {
+            liteRoom.disconnect();
+            liteRoom = null;
+          }
+          await endServerSession("liveavatarLiteEleven", liteSessionId);
+          liteSessionId = null;
         },
       },
     };

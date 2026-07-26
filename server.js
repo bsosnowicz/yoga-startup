@@ -8,6 +8,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { buildCoachPrompt, extractionPrompt, parseExtraction } = require("./memory");
 const { buildPostureCue, buildPostureAffirmation, listExerciseCues } = require("./posture");
 
@@ -25,6 +26,7 @@ function loadEnvFile(filename = path.join(__dirname, ".env")) {
 loadEnvFile();
 
 const GROQ_TRAINER_PROMPT = "Jesteś przyjaznym trenerem jogi. Rozmawiasz po polsku. Odpowiadaj krótko i naturalnie. Nie widzisz fizycznie użytkownika, więc nigdy nie zgaduj ani nie wymyślaj konkretnych, technicznych błędów postawy (np. \"masz źle ustawione kolano\") — to mogłoby wprowadzić w błąd. Jeśli user zapyta, czy dobrze robi pozycję, odpowiedz ciepło i zachęcająco, bez wymyślonych szczegółów (np. \"Skup się na oddechu, idzie Ci dobrze... daj znać, jeśli coś Cię boli\"). Nigdy nie wspominaj o żadnym oddzielnym systemie, mechanizmie czy narzędziu do korekty postawy — po prostu bądź wspierającym trenerem, jednym spójnym głosem.";
+const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_flash_v2_5";
 
 // Sandbox LiveAvatar (LIVEAVATAR_SANDBOX=true) wspiera WYŁĄCZNIE tego jednego
 // awatara — inne avatar_id dają 400 "This avatar is not supported in sandbox
@@ -33,6 +35,19 @@ const GROQ_TRAINER_PROMPT = "Jesteś przyjaznym trenerem jogi. Rozmawiasz po pol
 // /v1/avatars/dd73ea75-1218-4ef3-92ce-606d5f7fbc0a na koncie z .env.
 const SANDBOX_AVATAR_ID = "dd73ea75-1218-4ef3-92ce-606d5f7fbc0a"; // Wayne
 const SANDBOX_VOICE_ID = "c2527536-6d1f-4412-a643-53a3497dada9"; // default_voice Wayne'a
+
+// server.js jest uruchamiany jako jeden proces Node dla wszystkich
+// adapterów. Adapter "LiveAvatar Lite + ElevenLabs" (patrz niżej) łączy się
+// przez natywny klient WebSocket (do ws_url LiveAvatar i do streamingu
+// ElevenLabs) — Node 18 (dotychczasowe minimum tego projektu) go nie ma;
+// doszedł jako stabilny, globalny dopiero w Node 22. Pozostałe adaptery nie
+// używają WebSocket po stronie serwera i działają identycznie na 18 i 22.
+if (typeof WebSocket === "undefined") {
+  console.warn(
+    "UWAGA: ten proces Node nie ma natywnego WebSocket (wymagany Node 22+). " +
+    "Adapter 'LiveAvatar Lite + ElevenLabs' nie zadziała, reszta aplikacji — tak."
+  );
+}
 
 function requireEnv(name) {
   if (!process.env[name]) throw new Error(`Brak ${name}. Uzupełnij tę zmienną w lokalnym pliku .env.`);
@@ -70,7 +85,12 @@ function responseItems(data) {
 // pozostaje wyłącznie po stronie serwera.
 const recordedSessions = new Map();
 const completedSessionIds = new Set();
-const LIVEAVATAR_PROVIDERS = new Set(["liveavatar", "liveavatarGroq"]);
+const LIVEAVATAR_PROVIDERS = new Set(["liveavatar", "liveavatarGroq", "liveavatarLiteEleven"]);
+// Sesje Lite: sessionId -> { agentWs, sessionToken, systemPrompt, history,
+// sseClients, turnInFlight, onSpeakEnded, turnStartedAt, keepAliveTimer }.
+// Osobny rejestr od recordedSessions (który trzyma transkrypty do
+// Supabase) — ten tu trzyma żywe uchwyty do WebSocketów i SSE, per sesja.
+const liteSessions = new Map();
 const RECORDABLE_LIVEAVATAR_EVENTS = new Set([
   "session.started",
   "user.transcription",
@@ -696,7 +716,562 @@ const PROVIDERS = {
       });
     },
   },
+
+  // ---- LIVEAVATAR LITE + ELEVENLABS ----
+  // Prawdziwy tryb Lite (dawniej "Custom Mode"): LiveAvatar TYLKO renderuje
+  // twarz, cały pipeline (STT/LLM/TTS) jest po naszej stronie. To zupełnie
+  // inny mechanizm niż FULL (liveavatar/liveavatarGroq wyżej): zamiast
+  // LiveKit data channel jest osobny WebSocket (ws_url) do sterowania
+  // awatarem komendami agent.speak/agent.speak_end. Zweryfikowane
+  // bezpośrednio na koncie testowym (sandbox) przed napisaniem tego kodu:
+  // - /sessions/token {mode:"LITE", avatar_id} -> /sessions/start zwraca
+  //   { livekit_url, livekit_client_token, ws_url }. livekit_* idzie do
+  //   przeglądarki WYŁĄCZNIE pod wideo (bez publikowania mikrofonu!),
+  //   ws_url łączy się tu, na serwerze.
+  // - Audio do agent.speak MUSI być PCM 16-bit, 24kHz, mono, base64 —
+  //   zły format daje niemy/zniekształcony obraz awatara BEZ błędu.
+  // - Zamykanie sesji Lite różni się od Full: dokumentacja HeyGena podaje
+  //   "DELETE /v1/sessions", co w praktyce zwraca 405. Działający,
+  //   zweryfikowany bezpośrednim wywołaniem sposób to stary
+  //   POST /v1/sessions/stop, ale z Authorization: Bearer <session_token>
+  //   (nie X-API-KEY jak w Full mode).
+  // - ws_url wymaga natywnego klienta WebSocket (patrz ostrzeżenie o
+  //   Node 22 na górze pliku) — ElevenLabs streaming też.
+  liveavatarLiteEleven: {
+    label: "LiveAvatar Lite + ElevenLabs",
+    async getSessionToken() {
+      const apiKey = requireEnv("LIVEAVATAR_API_KEY");
+      requireEnv("ELEVENLABS_API_KEY");
+      requireEnv("ELEVENLABS_VOICE_ID");
+      requireEnv("GROQ_API_KEY");
+      if (typeof WebSocket === "undefined") {
+        throw new Error("Ten proces Node nie ma natywnego WebSocket — uruchom server.js pod Node 22+.");
+      }
+      const avatarId = process.env.LIVEAVATAR_AVATAR_ID || "55eec60c-d665-4972-a529-bbdcaf665ab8";
+
+      // System prompt trenerki (TRAINER_SYSTEM_PROMPT, ta sama treść co dla
+      // Anam — scenariusze czasu/kondycji/kontuzji) + ograniczona pamięć z
+      // Supabase, identycznie jak w istniejącym mechanizmie Memory Cleanup.
+      const memory = await loadMemoryContext(memoryUserId());
+      const systemPrompt = buildCoachPrompt(TRAINER_SYSTEM_PROMPT, memory);
+
+      const tokenData = await liveAvatarApi(apiKey, "/sessions/token", {
+        method: "POST",
+        body: JSON.stringify({
+          mode: "LITE",
+          avatar_id: avatarId,
+          is_sandbox: process.env.LIVEAVATAR_SANDBOX === "true",
+          // Domyślnie "high" — obniżone do "medium", eksperymentalnie, w
+          // nadziei na krótszy czas kodowania/dostarczenia klatki. Wartości
+          // potwierdzone bezpośrednio ze schematu API LiveAvatar:
+          // very_high/high/medium/low. Nadpisywalne w .env, gdyby jakość
+          // spadła zauważalnie.
+          video_settings: { quality: process.env.LIVEAVATAR_VIDEO_QUALITY || "medium" },
+        }),
+      });
+      const sessionToken = tokenData?.data?.session_token;
+      if (!sessionToken) throw new Error("LiveAvatar nie zwrócił session_token (Lite).");
+
+      const startRes = await fetch("https://api.liveavatar.com/v1/sessions/start", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      });
+      const startData = await startRes.json();
+      const session_id = startData?.data?.session_id;
+      const livekitUrl = startData?.data?.livekit_url;
+      const livekitToken = startData?.data?.livekit_client_token;
+      const wsUrl = startData?.data?.ws_url;
+      if (!startRes.ok || !wsUrl) {
+        console.error("Błąd LiveAvatar (Lite start):", startRes.status, JSON.stringify(startData));
+        throw new Error(startData?.message || `LiveAvatar nie zwrócił ws_url (Lite, status ${startRes.status}).`);
+      }
+
+      const agentWs = new WebSocket(wsUrl);
+      const session = {
+        sessionId: session_id,
+        sessionToken,
+        systemPrompt,
+        history: [],
+        agentWs,
+        ttsWs: null,
+        sseClients: new Set(),
+        turnInFlight: false,
+        onSpeakEnded: null,
+        activeTurnAbort: null,
+        turnStartedAt: performance.now(),
+        keepAliveTimer: null,
+      };
+
+      // Zanim oddamy sesję przeglądarce, czekamy na potwierdzenie
+      // "connected" na WS — komendy wysłane wcześniej są po cichu gubione
+      // (bez błędu), więc to nie jest kosmetyka. Otwieramy równolegle
+      // (Promise.all) połączenie do ElevenLabs (multi-context, patrz
+      // openElevenLabsSocket) — trzymane przez całą sesję i reużywane w
+      // każdej turze, żeby nie płacić handshake'u (~130-150ms zmierzone na
+      // żywo) za każdym razem od nowa.
+      await Promise.all([
+        new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error("LiveAvatar Lite: WebSocket nie potwierdził połączenia w 10s.")), 10000);
+          agentWs.onerror = (e) => { clearTimeout(timeout); reject(new Error(e.message || "LiveAvatar Lite: błąd WebSocket.")); };
+          agentWs.onclose = () => { if (liteSessions.has(session_id)) console.warn(`LiveAvatar Lite: WS sesji ${session_id} zamknięty.`); };
+          agentWs.onmessage = (ev) => {
+            let parsed;
+            try { parsed = JSON.parse(ev.data); } catch (_) { return; }
+            if (parsed.type === "session.state_updated" && parsed.state === "connected") {
+              clearTimeout(timeout);
+              agentWs.send(liteCommand("agent.start_listening"));
+              resolve();
+              return;
+            }
+            if (parsed.type === "agent.speak_started") {
+              sseSend(session, { stage: "avatar_speak_started", ms: Math.round(performance.now() - session.turnStartedAt) });
+              return;
+            }
+            if (parsed.type === "agent.speak_ended") {
+              sseSend(session, { stage: "avatar_speak_ended", ms: Math.round(performance.now() - session.turnStartedAt) });
+              if (session.onSpeakEnded) { const cb = session.onSpeakEnded; session.onSpeakEnded = null; cb(); }
+            }
+            // agent.audio_buffer_appended/committed — potwierdzenia bufora,
+            // widoczne w testach na żywo, ale nic z nimi tu nie robimy.
+          };
+        }),
+        openElevenLabsSocket().then((ws) => {
+          session.ttsWs = ws;
+          // Po udanym połączeniu podmieniamy handlery na "trwa sesja" —
+          // jeśli padnie później, runLiteTurn reconnectuje leniwie przy
+          // następnej turze (patrz sprawdzenie readyState tam).
+          ws.onclose = () => console.warn(`LiveAvatar Lite [${session_id}]: połączenie ElevenLabs zamknięte.`);
+          ws.onerror = (e) => console.warn(`LiveAvatar Lite [${session_id}]: błąd połączenia ElevenLabs:`, e.message);
+        }),
+      ]);
+
+      liteSessions.set(session_id, session);
+      session.keepAliveTimer = setInterval(() => {
+        try { agentWs.send(liteCommand("session.keep_alive")); } catch (_) {}
+      }, 100000); // limit bezczynności to 5 min — odświeżamy co ~100s
+
+      // Powitanie: opóźnione o 1.5s, żeby przeglądarka zdążyła dołączyć do
+      // pokoju LiveKit (zaraz po odebraniu tej odpowiedzi) zanim popłynie
+      // pierwsze audio — inaczej ryzykujemy urwany początek powitania.
+      setTimeout(() => { runLiteTurn(session, null); }, 1500);
+
+      return { sessionToken, sessionId: session_id, livekitUrl, livekitToken };
+    },
+    async endSession(sessionId) {
+      const session = liteSessions.get(sessionId);
+      if (!session) return;
+      clearInterval(session.keepAliveTimer);
+      liteSessions.delete(sessionId);
+      for (const res of session.sseClients) { try { res.end(); } catch (_) {} }
+      try { session.agentWs.close(); } catch (_) {}
+      try { session.ttsWs && session.ttsWs.send(JSON.stringify({ close_socket: true })); } catch (_) {}
+      try { session.ttsWs && session.ttsWs.close(); } catch (_) {}
+      await fetch("https://api.liveavatar.com/v1/sessions/stop", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.sessionToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      console.log(`LiveAvatar Lite + ElevenLabs: sesja ${sessionId} zatrzymana.`);
+    },
+  },
 };
+
+// ---- LIVEAVATAR LITE + ELEVENLABS: pipeline pojedynczej tury rozmowy ----
+// Wywoływane z /api/lite-turn po tym, jak przeglądarka (Web Speech API)
+// dostarczy finalny transkrypt użytkownika. Groq (streaming) -> ElevenLabs
+// (streaming, PCM 24kHz) -> agent.speak na ws_url, chunk po chunku, żeby
+// pierwsze audio poleciało do awatara zanim LLM skończy całą odpowiedź.
+const LITE_BYTES_PER_SEC = 48000; // PCM16 mono @ 24kHz = 2 bajty * 24000/s
+// Skrócone z zalecanych przez LiveAvatar 600ms do 250ms — eksperymentalne,
+// szybszy start mówienia awatara kosztem ryzyka mikroprzycięcia. Strojone
+// pod niższą latencję; jeśli słychać cięcie na starcie, podnieś z powrotem
+// bliżej 0.6.
+const LITE_FIRST_CHUNK_BYTES = Math.floor(LITE_BYTES_PER_SEC * 0.25);
+const LITE_NEXT_CHUNK_BYTES = LITE_BYTES_PER_SEC;
+
+function liteCommand(type, extra = {}) {
+  return JSON.stringify({ type, event_id: extra.event_id || crypto.randomUUID(), ...extra });
+}
+
+function sseSend(session, payload) {
+  const line = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of session.sseClients) {
+    try { res.write(line); } catch (_) { session.sseClients.delete(res); }
+  }
+}
+
+// Jedno połączenie WebSocket do ElevenLabs na całą sesję (multi-context —
+// wiele kolejnych "tur" bez ponownego handshake'u), zamiast nowego
+// połączenia za każdą wypowiedzią. Zmierzone na żywo: handshake ~130-150ms,
+// płacony teraz raz na sesję zamiast raz na turę. context_id per turę
+// pozwala routować audio do właściwej wypowiedzi na współdzielonym
+// połączeniu (limit: max 5 równoległych kontekstów, nieużywany tu — mamy
+// zawsze jeden aktywny na raz dzięki turnInFlight).
+function openElevenLabsSocket() {
+  return new Promise((resolve, reject) => {
+    const url = `wss://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/multi-stream-input?model_id=${ELEVENLABS_MODEL_ID}&output_format=pcm_24000`;
+    const ws = new WebSocket(url);
+    const timeout = setTimeout(() => reject(new Error("ElevenLabs: WebSocket nie otworzył się w 10s.")), 10000);
+    ws.onopen = () => { clearTimeout(timeout); resolve(ws); };
+    ws.onerror = (e) => { clearTimeout(timeout); reject(new Error(e.message || "ElevenLabs: błąd WebSocket.")); };
+  });
+}
+
+// userText === null oznacza turę otwierającą (patrz wywołanie w
+// getSessionToken poniżej) — TRAINER_SYSTEM_PROMPT zakłada, że to AWATAR
+// zaczyna rozmowę pytaniem o czas/kondycję. W Full mode robi to za nas
+// LiveAvatar (opening_text na Contexcie); w Lite nic tego nie wywołuje samo
+// z siebie, więc odpalamy jedną turę "na sucho" — sam system prompt, bez
+// wiadomości użytkownika — żeby model wygenerował powitanie.
+async function runLiteTurn(session, userText) {
+  // Jedna wypowiedź na raz, ale z obsługą barge-in: /api/lite-interrupt
+  // (patrz niżej) woła session.activeTurnAbort(), co przerywa Groq
+  // (AbortController) i pozwala tej turze zakończyć się od razu zamiast
+  // czekać na jej naturalny koniec.
+  if (session.turnInFlight) {
+    console.warn(`LiveAvatar Lite [${session.sessionId}]: tura zignorowana — poprzednia jeszcze trwa.`);
+    return;
+  }
+  session.turnInFlight = true;
+  session.turnStartedAt = performance.now();
+  const controller = new AbortController();
+  session.activeTurnAbort = () => controller.abort();
+  const mark = (stage) => {
+    console.log(`LiveAvatar Lite [${session.sessionId}] ${stage}`);
+    sseSend(session, { stage, ms: Math.round(performance.now() - session.turnStartedAt) });
+  };
+  // Awaryjny wyłącznik: przy realnym teście na żywo ElevenLabs czasem nie
+  // wysłał "isFinal" w rozsądnym czasie mimo że audio już dotarło, co bez
+  // tego zabezpieczenia trwale blokowało turnInFlight (żadna kolejna
+  // wypowiedź użytkownika nigdy by się nie przetworzyła — dokładnie to, co
+  // zaobserwowano). Niezależnie od tego, GDZIEKOLWIEK coś innego by się
+  // zawiesiło, ta tura i tak zwolni blokadę zamiast wisieć w nieskończoność.
+  let settled = false;
+  let contextId = null;
+  const watchdog = setTimeout(() => {
+    if (settled) return;
+    console.error(`LiveAvatar Lite [${session.sessionId}]: tura nie zakończyła się w 30s — wymuszam zwolnienie blokady.`);
+    session.turnInFlight = false;
+    sseSend(session, { stage: "error", message: "Tura przekroczyła limit czasu (30s) — spróbuj ponownie." });
+  }, 30000);
+
+  try {
+    if (userText) {
+      recordLiveAvatarEvent({
+        provider: "liveavatarLiteEleven",
+        sessionId: session.sessionId,
+        eventType: "user.transcription",
+        event: { text: userText },
+      });
+    }
+    mark("stt_ready"); // STT już gotowe (zrobione w przeglądarce, stąd ~0ms)
+    session.agentWs.send(liteCommand("agent.stop_listening"));
+
+    if (userText) session.history.push({ role: "user", content: userText });
+    if (session.history.length > 4) session.history.splice(0, session.history.length - 4);
+
+    // Reconnect, gdyby trwałe połączenie ElevenLabs padło między turami
+    // (rzadkie, ale WebSocket może zostać zerwany przez sieć/serwer).
+    if (!session.ttsWs || session.ttsWs.readyState !== WebSocket.OPEN) {
+      session.ttsWs = await openElevenLabsSocket();
+    }
+    const ttsWs = session.ttsWs;
+    contextId = `ctx-${Date.now()}`;
+
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      signal: controller.signal,
+      body: JSON.stringify({
+        // llama-3.1-8b-instant było ~100-150ms szybsze do pierwszego tokena,
+        // ale w realnym teście robiło błędy gramatyczne i konfabulowało
+        // (np. zmyśloną treść niezwiązaną z tym, co powiedział user) —
+        // niewart tego kompromis dla asystenta prowadzącego trening.
+        // Nadpisywalne przez GROQ_MODEL w .env, gdyby chcieć poeksperymentować.
+        model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+        temperature: 0.35,
+        max_tokens: 250,
+        stream: true,
+        messages: [{ role: "system", content: session.systemPrompt }, ...session.history],
+      }),
+    });
+    if (!groqRes.ok || !groqRes.body) throw new Error(`Groq ${groqRes.status}: ${await groqRes.text()}`);
+
+    const eventId = `speak-${Date.now()}`;
+    let pcmBuffer = Buffer.alloc(0);
+    let chunkTarget = LITE_FIRST_CHUNK_BYTES;
+    let firstAudioLogged = false;
+    let firstSentToAvatarLogged = false;
+
+    function flushPcm() {
+      while (pcmBuffer.length >= chunkTarget) {
+        const chunk = pcmBuffer.subarray(0, chunkTarget);
+        pcmBuffer = pcmBuffer.subarray(chunkTarget);
+        session.agentWs.send(liteCommand("agent.speak", { event_id: eventId, audio: chunk.toString("base64") }));
+        // Rozbija "TTS pierwszy chunk" (pierwszy bajt od ElevenLabs) od
+        // momentu faktycznego wysłania do LiveAvatar — czekamy na bufor
+        // LITE_FIRST_CHUNK_BYTES zanim cokolwiek wyślemy, więc to osobny,
+        // realny składnik opóźnienia.
+        if (!firstSentToAvatarLogged) { firstSentToAvatarLogged = true; mark("audio_sent_to_avatar"); }
+        chunkTarget = LITE_NEXT_CHUNK_BYTES;
+      }
+    }
+
+    let ttsEnded = false;
+    let allTextSent = false;
+    let quietTimer = null;
+    const ttsFinished = new Promise((resolve) => { ttsWs.onTextToSpeechFinished = resolve; });
+    // Zweryfikowane na żywo: ElevenLabs czasem nie wysyła "isFinal" mimo że
+    // całe audio już dotarło i LiveAvatar samo, niezależnie, uznaje
+    // wypowiedź za skończoną (wykrywa brak nowego audio) i wysyła
+    // agent.speak_ended — zanim nasz kod zdąży wysłać agent.speak_end. Bez
+    // tego runLiteTurn czekał na isFinal, które nie nadchodzi, więc nigdy
+    // nie zdążał podpiąć się pod realny agent.speak_ended (przechodził
+    // "obok"), turnInFlight zostawał zablokowany na dziesiątki sekund, a
+    // każda kolejna wypowiedź użytkownika była po cichu ignorowana. Zamiast
+    // czekać ślepo, kończymy turę TTS po ~2s ciszy (braku nowego audio) od
+    // wysłania całego tekstu — adaptacyjnie, niezależnie od isFinal.
+    function finishTts() {
+      if (ttsEnded) return;
+      ttsEnded = true;
+      clearTimeout(quietTimer);
+      if (pcmBuffer.length) {
+        session.agentWs.send(liteCommand("agent.speak", { event_id: eventId, audio: pcmBuffer.toString("base64") }));
+        pcmBuffer = Buffer.alloc(0);
+      }
+      session.agentWs.send(liteCommand("agent.speak_end", { event_id: eventId }));
+      // Zamykamy TYLKO ten kontekst, nie całe połączenie — reużywamy go w
+      // kolejnej turze (patrz komentarz przy openElevenLabsSocket).
+      try { ttsWs.send(JSON.stringify({ context_id: contextId, close_context: true })); } catch (_) {}
+      ttsWs.onTextToSpeechFinished && ttsWs.onTextToSpeechFinished();
+    }
+    function scheduleQuietCheck() {
+      clearTimeout(quietTimer);
+      quietTimer = setTimeout(() => { if (allTextSent) finishTts(); }, 2000);
+    }
+    ttsWs.onmessage = (ev) => {
+      if (controller.signal.aborted) return; // przerwane przez barge-in — nie wysyłaj więcej audio
+      let parsed;
+      try { parsed = JSON.parse(ev.data); } catch (_) { return; }
+      const msgContextId = parsed.contextId || parsed.context_id;
+      if (msgContextId && msgContextId !== contextId) return; // wiadomość spoza tej tury (np. spóźniona z poprzedniej)
+      if (parsed.audio) {
+        if (!firstAudioLogged) { firstAudioLogged = true; mark("tts_first_chunk"); }
+        pcmBuffer = Buffer.concat([pcmBuffer, Buffer.from(parsed.audio, "base64")]);
+        flushPcm();
+        scheduleQuietCheck(); // nowe audio = jeszcze nie cisza, przesuwamy licznik
+      }
+      // isFinal to najszybsza, ale niegwarantowana ścieżka — jeśli przyjdzie,
+      // kończymy od razu zamiast czekać na ciszę.
+      if (parsed.isFinal) finishTts();
+    };
+    // Pierwsza wiadomość nowego kontekstu — chunk_length_schedule niżej niż
+    // domyślny, żeby ElevenLabs zaczynał generować audio po krótszym
+    // fragmencie tekstu (szybszy pierwszy dźwięk, kosztem gorszej
+    // płynności/intonacji na granicach fragmentów — eksperymentalne,
+    // strojone pod niższą latencję).
+    ttsWs.send(JSON.stringify({
+      text: " ",
+      context_id: contextId,
+      voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+      generation_config: { chunk_length_schedule: [50, 90, 120, 150] },
+      xi_api_key: process.env.ELEVENLABS_API_KEY,
+    }));
+
+    // Strumieniujemy odpowiedź Groq zdanie po zdaniu do ElevenLabs, żeby
+    // TTS mógł zacząć generować zanim LLM dokończy całą wypowiedź.
+    const decoder = new TextDecoder();
+    let sseBuffer = "";
+    let ttsSentenceBuffer = "";
+    let fullReplyText = "";
+    let firstTokenLogged = false;
+    for await (const chunk of groqRes.body) {
+      sseBuffer += decoder.decode(chunk, { stream: true });
+      const lines = sseBuffer.split("\n");
+      sseBuffer = lines.pop(); // ostatnia (niedokończona) linia zostaje w buforze
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (!data || data === "[DONE]") continue;
+        let json;
+        try { json = JSON.parse(data); } catch (_) { continue; }
+        const delta = json?.choices?.[0]?.delta?.content;
+        if (!delta) continue;
+        if (!firstTokenLogged) { firstTokenLogged = true; mark("llm_first_token"); }
+        fullReplyText += delta;
+        ttsSentenceBuffer += delta;
+        // Próg obniżony z 140 do 60 znaków — ElevenLabs dostaje tekst do
+        // syntezy szybciej (eksperymentalne, patrz komentarz wyżej).
+        if (/[.!?\n]\s*$/.test(ttsSentenceBuffer) || ttsSentenceBuffer.length > 60) {
+          ttsWs.send(JSON.stringify({ text: ttsSentenceBuffer, context_id: contextId }));
+          ttsSentenceBuffer = "";
+        }
+      }
+    }
+    if (ttsSentenceBuffer) ttsWs.send(JSON.stringify({ text: ttsSentenceBuffer, context_id: contextId }));
+    ttsWs.send(JSON.stringify({ text: "", context_id: contextId, flush: true }));
+    allTextSent = true;
+    scheduleQuietCheck(); // cały tekst wysłany — odpal odliczanie ciszy, nawet jeśli audio jeszcze nie napłynęło
+
+    session.history.push({ role: "assistant", content: fullReplyText });
+    recordLiveAvatarEvent({
+      provider: "liveavatarLiteEleven",
+      sessionId: session.sessionId,
+      eventType: "avatar.transcription",
+      event: { text: fullReplyText },
+    });
+    // Jedyny sposób, żeby przeglądarka poznała treść odpowiedzi awatara w
+    // Lite mode (w przeciwieństwie do FULL, gdzie leci to przez LiveKit data
+    // channel) — potrzebne dla detectActiveExercise() w index.html, żeby
+    // auto-detekcja ćwiczenia z rozmowy działała tak samo jak w FULL mode.
+    sseSend(session, { stage: "avatar_transcription", text: fullReplyText });
+
+    if (!controller.signal.aborted) {
+      await ttsFinished;
+      // Czekamy na agent.speak_ended (nasłuch podpięty przy tworzeniu sesji
+      // w getSessionToken) zanim wrócimy do stanu nasłuchu — z
+      // zabezpieczeniem czasowym, gdyby event z jakiegoś powodu nie dotarł.
+      await new Promise((resolve) => {
+        session.onSpeakEnded = resolve;
+        setTimeout(resolve, 20000);
+      });
+      session.agentWs.send(liteCommand("agent.start_listening"));
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      console.log(`LiveAvatar Lite [${session.sessionId}] tura przerwana (barge-in).`);
+      sseSend(session, { stage: "interrupted" });
+    } else {
+      console.error(`LiveAvatar Lite [${session.sessionId}]: błąd tury:`, error.message);
+      sseSend(session, { stage: "error", message: error.message });
+    }
+  } finally {
+    settled = true;
+    clearTimeout(watchdog);
+    session.activeTurnAbort = null;
+    // Połączenie ElevenLabs zostaje otwarte na kolejną turę (patrz
+    // openElevenLabsSocket) — zamykamy tu tylko kontekst tej tury, na
+    // wypadek gdyby finishTts() nie zdążył tego zrobić (błąd/przerwanie).
+    if (contextId && session.ttsWs) {
+      try { session.ttsWs.send(JSON.stringify({ context_id: contextId, close_context: true })); } catch (_) {}
+    }
+    session.turnInFlight = false;
+    console.log(`LiveAvatar Lite [${session.sessionId}] tura zakończona, blokada zwolniona.`);
+  }
+}
+
+// Wygłasza gotowy tekst (korekta/pochwała postawy z posture.js + Groq, patrz
+// /api/posture-correction i /api/posture-affirmation niżej) w aktywnej sesji
+// LiveAvatar Lite. Odrębna od runLiteTurn: tam tekst odpowiedzi strumieniuje
+// się zdanie po zdaniu WPROST z Groq (dla niskiej latencji pierwszej głoski);
+// tu tekst jest już kompletny, nie ma czego strumieniować, więc to prostszy,
+// jednorazowy przebieg tego samego ostatniego odcinka (ElevenLabs -> PCM ->
+// agent.speak). Celowo NIE dopisane do runLiteTurn — ta funkcja ma kilka
+// nietrywialnych fixów wystrojonych pod żywą rozmowę (watchdog na brakujące
+// isFinal, AbortController po Groq); mieszanie dwóch przypadków użycia w
+// jednej funkcji groziłoby regresją tamtej ścieżki.
+async function speakLiteCue(session, text, { interrupt = false } = {}) {
+  if (interrupt) {
+    // Ta sama sekwencja co /api/lite-interrupt — korekta ma prawo przerwać
+    // awatara w trakcie mówienia, tak jak avatar.interrupt w FULL mode.
+    if (session.activeTurnAbort) session.activeTurnAbort();
+    if (session.onSpeakEnded) { const cb = session.onSpeakEnded; session.onSpeakEnded = null; cb(); }
+    try { session.agentWs.send(liteCommand("agent.interrupt")); } catch (_) {}
+    session.turnInFlight = false;
+  }
+  if (session.turnInFlight) {
+    // Pochwała nie przerywa (interrupt=false) — jeśli awatar akurat mówi,
+    // wolimy pominąć tę turę niż walczyć o tę samą blokację co runLiteTurn.
+    console.warn(`LiveAvatar Lite [${session.sessionId}]: korekta/pochwała postawy zignorowana — tura w toku.`);
+    return false;
+  }
+  session.turnInFlight = true;
+  let aborted = false;
+  let resolveTurn = null;
+  // Barge-in w trakcie korekty (patrz /api/lite-interrupt) musi móc przerwać
+  // TĘ turę natychmiast, tak samo jak przerywa Groq w runLiteTurn.
+  session.activeTurnAbort = () => { aborted = true; if (resolveTurn) resolveTurn(); };
+  try {
+    if (!session.ttsWs || session.ttsWs.readyState !== WebSocket.OPEN) {
+      session.ttsWs = await openElevenLabsSocket();
+    }
+    const ttsWs = session.ttsWs;
+    const contextId = `posture-${Date.now()}`;
+    const eventId = `speak-${Date.now()}`;
+    let pcmBuffer = Buffer.alloc(0);
+    let chunkTarget = LITE_FIRST_CHUNK_BYTES;
+    function flushPcm() {
+      while (pcmBuffer.length >= chunkTarget) {
+        const chunk = pcmBuffer.subarray(0, chunkTarget);
+        pcmBuffer = pcmBuffer.subarray(chunkTarget);
+        session.agentWs.send(liteCommand("agent.speak", { event_id: eventId, audio: chunk.toString("base64") }));
+        chunkTarget = LITE_NEXT_CHUNK_BYTES;
+      }
+    }
+    await new Promise((resolve) => {
+      resolveTurn = resolve;
+      let done = false;
+      let quietTimer = null;
+      const watchdog = setTimeout(() => { if (!done) { done = true; resolve(); } }, 20000);
+      function finish() {
+        if (done) return;
+        done = true;
+        clearTimeout(watchdog);
+        clearTimeout(quietTimer);
+        if (!aborted) {
+          if (pcmBuffer.length) {
+            session.agentWs.send(liteCommand("agent.speak", { event_id: eventId, audio: pcmBuffer.toString("base64") }));
+            pcmBuffer = Buffer.alloc(0);
+          }
+          session.agentWs.send(liteCommand("agent.speak_end", { event_id: eventId }));
+        }
+        try { ttsWs.send(JSON.stringify({ context_id: contextId, close_context: true })); } catch (_) {}
+        resolve();
+      }
+      ttsWs.onmessage = (ev) => {
+        if (aborted) return;
+        let parsed;
+        try { parsed = JSON.parse(ev.data); } catch (_) { return; }
+        const msgContextId = parsed.contextId || parsed.context_id;
+        if (msgContextId && msgContextId !== contextId) return; // spóźniona wiadomość z innej tury
+        if (parsed.audio) {
+          pcmBuffer = Buffer.concat([pcmBuffer, Buffer.from(parsed.audio, "base64")]);
+          flushPcm();
+          clearTimeout(quietTimer);
+          quietTimer = setTimeout(finish, 2000); // ten sam adaptacyjny fallback co finishTts() w runLiteTurn
+        }
+        if (parsed.isFinal) finish();
+      };
+      ttsWs.send(JSON.stringify({
+        text,
+        context_id: contextId,
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+        generation_config: { chunk_length_schedule: [50, 90, 120, 150] },
+        xi_api_key: process.env.ELEVENLABS_API_KEY,
+      }));
+      ttsWs.send(JSON.stringify({ text: "", context_id: contextId, flush: true }));
+    });
+    if (aborted) return false;
+    // Sesja Lite zna dokładny wygłoszony tekst (w przeciwieństwie do FULL,
+    // gdzie serwer nie widzi z powrotem transkrypcji korekty) — zapisujemy go
+    // do Session Recorder / pamięci tak samo jak zwykłe repliki avatara.
+    recordLiveAvatarEvent({
+      provider: "liveavatarLiteEleven",
+      sessionId: session.sessionId,
+      eventType: "avatar.transcription",
+      event: { text },
+    });
+    await new Promise((resolve) => {
+      session.onSpeakEnded = resolve;
+      setTimeout(resolve, 20000);
+    });
+    session.agentWs.send(liteCommand("agent.start_listening"));
+    return true;
+  } finally {
+    session.activeTurnAbort = null;
+    session.turnInFlight = false;
+  }
+}
 
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -808,6 +1383,9 @@ const server = http.createServer(async (req, res) => {
   // z transkrypcji rozmowy. Tekst generuje Groq (generateGroqCorrection,
   // patrz wyżej); jeśli to zawiedzie (brak klucza, błąd sieci, timeout), leci
   // fallback z posture.js — korekta nigdy nie milczy, tylko brzmi sztywniej.
+  // sessionId (opcjonalny) pozwala dodatkowo wygłosić korektę na żywo w
+  // sesji LiveAvatar Lite — patrz speakLiteCue() niżej (FULL mode dostaje
+  // tekst z tej odpowiedzi i mówi go sam przez LiveKit, patrz index.html).
   if (req.method === "POST" && req.url === "/api/posture-correction") {
     try {
       const body = await readJsonBody(req);
@@ -824,12 +1402,74 @@ const server = http.createServer(async (req, res) => {
       } catch (groqError) {
         console.warn("Posture Correction: Groq nie odpowiedział, używam fallbacku:", groqError.message);
       }
+      const liteSession = liteSessions.get(body.sessionId);
+      if (liteSession) {
+        // Fire-and-forget, jak /api/lite-turn niżej — postęp/błędy tylko w
+        // logu serwera, odpowiedź HTTP nie czeka na wygłoszenie korekty.
+        speakLiteCue(liteSession, cue.text, { interrupt: true }).catch((e) =>
+          console.error("LiveAvatar Lite: błąd wygłoszenia korekty postawy:", e.message)
+        );
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ...cue, source }));
     } catch (e) {
       console.error("Błąd Posture Correction:", e.message);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Strumień statusu pipeline'u LiveAvatar Lite + ElevenLabs (Server-Sent
+  // Events — natywne po obu stronach, bez dodatkowej biblioteki). Front-end
+  // otwiera to raz po starcie sesji i na tej podstawie loguje identyczny
+  // format "LATENCJA ODPOWIEDZI" co pozostałe adaptery, plus czasy pośrednie
+  // per ogniwo (STT/LLM/TTS/avatar).
+  if (req.method === "GET" && req.url.startsWith("/api/lite-events")) {
+    const sessionId = new URL(req.url, "http://localhost").searchParams.get("sessionId");
+    const session = liteSessions.get(sessionId);
+    if (!session) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Nieznana sesja Lite." }));
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.write(": connected\n\n");
+    session.sseClients.add(res);
+    req.on("close", () => session.sseClients.delete(res));
+    return;
+  }
+
+  // Finalny transkrypt użytkownika (z Web Speech API w przeglądarce) ->
+  // uruchamia jedną turę pipeline'u Groq -> ElevenLabs -> ws_url. Odpowiada
+  // od razu (202) — postęp leci przez /api/lite-events, nie przez ten request.
+  if (req.method === "POST" && req.url === "/api/lite-turn") {
+    try {
+      const body = await readJsonBody(req);
+      const session = liteSessions.get(body.sessionId);
+      if (!session) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Nieznana sesja Lite." }));
+        return;
+      }
+      if (!body.text || typeof body.text !== "string" || !body.text.trim()) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Brak tekstu w treści żądania." }));
+        return;
+      }
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      runLiteTurn(session, body.text.trim());
+    } catch (e) {
+      console.error("LiveAvatar Lite: błąd /api/lite-turn:", e.message);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
     }
     return;
   }
@@ -853,12 +1493,52 @@ const server = http.createServer(async (req, res) => {
       } catch (groqError) {
         console.warn("Posture Affirmation: Groq nie odpowiedział, używam fallbacku:", groqError.message);
       }
+      const liteSession = liteSessions.get(body.sessionId);
+      if (liteSession) {
+        // interrupt: false — pochwała nie jest pilna; jeśli awatar akurat
+        // mówi (turnInFlight), speakLiteCue po prostu rezygnuje (patrz niżej).
+        speakLiteCue(liteSession, affirmation.text, { interrupt: false }).catch((e) =>
+          console.error("LiveAvatar Lite: błąd wygłoszenia pochwały postawy:", e.message)
+        );
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ...affirmation, source }));
     } catch (e) {
       console.error("Błąd Posture Affirmation:", e.message);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Barge-in: przeglądarka wywołuje to, gdy użytkownik zaczyna mówić W
+  // TRAKCIE gdy awatar jeszcze gada. Przerywa bieżącą turę (Groq przez
+  // AbortController, LiveAvatar przez agent.interrupt) i od razu zwalnia
+  // blokadę, żeby nowa wypowiedź użytkownika mogła ruszyć jako świeża tura.
+  if (req.method === "POST" && req.url === "/api/lite-interrupt") {
+    try {
+      const body = await readJsonBody(req);
+      const session = liteSessions.get(body.sessionId);
+      if (session) {
+        if (session.activeTurnAbort) session.activeTurnAbort();
+        if (session.onSpeakEnded) { const cb = session.onSpeakEnded; session.onSpeakEnded = null; cb(); }
+        try {
+          session.agentWs.send(liteCommand("agent.interrupt"));
+          session.agentWs.send(liteCommand("agent.start_listening"));
+        } catch (_) {}
+        // Pas i szelki: gdyby powyższe z jakiegoś powodu nie odblokowało w
+        // porę (np. przerwanie trafiło między turami), i tak zwalniamy.
+        session.turnInFlight = false;
+        console.log(`LiveAvatar Lite [${session.sessionId}]: barge-in.`);
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      console.error("LiveAvatar Lite: błąd /api/lite-interrupt:", e.message);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
     }
     return;
   }
