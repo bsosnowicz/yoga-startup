@@ -9,6 +9,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { buildCoachPrompt, extractionPrompt, parseExtraction } = require("./memory");
+const { buildPostureCue, buildPostureAffirmation, listExerciseCues } = require("./posture");
 
 // Minimalna obsługa .env bez dokładania zależności do tego małego testowego
 // serwera. Zmienne już ustawione w środowisku mają pierwszeństwo.
@@ -23,7 +24,15 @@ function loadEnvFile(filename = path.join(__dirname, ".env")) {
 }
 loadEnvFile();
 
-const GROQ_TRAINER_PROMPT = "Jesteś przyjaznym trenerem jogi. Rozmawiasz po polsku. Odpowiadaj krótko i naturalnie.";
+const GROQ_TRAINER_PROMPT = "Jesteś przyjaznym trenerem jogi. Rozmawiasz po polsku. Odpowiadaj krótko i naturalnie. Nie widzisz fizycznie użytkownika, więc nigdy nie zgaduj ani nie wymyślaj konkretnych, technicznych błędów postawy (np. \"masz źle ustawione kolano\") — to mogłoby wprowadzić w błąd. Jeśli user zapyta, czy dobrze robi pozycję, odpowiedz ciepło i zachęcająco, bez wymyślonych szczegółów (np. \"Skup się na oddechu, idzie Ci dobrze... daj znać, jeśli coś Cię boli\"). Nigdy nie wspominaj o żadnym oddzielnym systemie, mechanizmie czy narzędziu do korekty postawy — po prostu bądź wspierającym trenerem, jednym spójnym głosem.";
+
+// Sandbox LiveAvatar (LIVEAVATAR_SANDBOX=true) wspiera WYŁĄCZNIE tego jednego
+// awatara — inne avatar_id dają 400 "This avatar is not supported in sandbox
+// mode". Zweryfikowane bezpośrednio: docs.liveavatar.com/docs/sandbox-mode
+// ("Limited avatars — only the Wayne avatar is available") + GET
+// /v1/avatars/dd73ea75-1218-4ef3-92ce-606d5f7fbc0a na koncie z .env.
+const SANDBOX_AVATAR_ID = "dd73ea75-1218-4ef3-92ce-606d5f7fbc0a"; // Wayne
+const SANDBOX_VOICE_ID = "c2527536-6d1f-4412-a643-53a3497dada9"; // default_voice Wayne'a
 
 function requireEnv(name) {
   if (!process.env[name]) throw new Error(`Brak ${name}. Uzupełnij tę zmienną w lokalnym pliku .env.`);
@@ -243,10 +252,83 @@ const TRAINER_SYSTEM_PROMPT = `[STYLE] Odpowiadaj wyłącznie po polsku, natural
 krótkimi zdaniami. Dodawaj pauzy używając '...'. Mów spokojnie i ciepło.
 [PERSONALITY] Jesteś Andrzej, doświadczonym trenerem jogi. Prowadzisz użytkownika przez
 krótką sesję. Na początku zapytaj, ile ma dziś czasu i jak ocenia swoją kondycję.
-Potem poprowadź go przez 2-3 proste pozycje (np. pozycja dziecka, kot-krowa,
-pies z głową w dół): powiedz jak wejść w pozycję, przypominaj o oddechu,
-po kilku oddechach powiedz jak wyjść. Reaguj na to, co mówi użytkownik -
-jeśli mówi, że coś boli albo że musi kończyć, dostosuj się natychmiast.`;
+Potem poprowadź go przez pozycję dziecka i psa z głową w dół (dokładnie tymi
+nazwami): powiedz jak wejść w pozycję, przypominaj o oddechu, po kilku
+oddechach powiedz jak wyjść. Reaguj na to, co mówi użytkownik -
+jeśli mówi, że coś boli albo że musi kończyć, dostosuj się natychmiast.
+[POSTAWA] Nie widzisz fizycznie użytkownika, więc nigdy nie zgaduj ani nie
+wymyślaj konkretnych, technicznych błędów postawy (np. "masz źle ustawione
+kolano") — to mogłoby wprowadzić w błąd. Jeśli user zapyta, czy dobrze robi
+pozycję, odpowiedz ciepło i zachęcająco, bez wymyślonych szczegółów (np.
+"Skup się na oddechu, idzie Ci dobrze... daj znać, jeśli coś Cię boli").
+Nigdy nie wspominaj o żadnym oddzielnym systemie, mechanizmie czy narzędziu
+do korekty postawy — po prostu bądź wspierającym trenerem, jednym spójnym
+głosem.`;
+
+// Styl-guide korekt postawy — startowy, do dopracowania przez prawdziwego
+// trenera jogi. Karmi generateGroqCorrection() niżej: trener pisze te zasady
+// RAZ (ton + bezpieczeństwo), zamiast osobnego zdania na każdą kombinację
+// ćwiczenie×błąd w posture.js.
+const POSTURE_COACH_STYLE_GUIDE = `Jesteś Andrzej, trenerem jogi, korygujesz na żywo postawę
+użytkownika w trakcie ćwiczenia. Mów krótko, spokojnie i ciepło, jak w rozmowie — jedno zdanie,
+bez wstępu typu "widzę że". Nigdy nie diagnozuj i nie nazywaj kontuzji. Nigdy nie każ przeć przez
+ból. Jeśli nie masz pewności jak mocno skorygować, zasugeruj złagodzenie pozycji zamiast pogłębienia.`;
+
+// Generuje tekst korekty postawy na podstawie etykiety błędu + styl-guide'u
+// wyżej — ten sam wzorzec fetch co extractAndPersistMemory() powyżej (Groq,
+// OpenAI-compatible /chat/completions). Rzuca wyjątek przy błędzie/braku
+// klucza — wywołujący (patrz /api/posture-correction) łapie to i używa
+// fallbacku z posture.js, tak jak loadMemoryContext() robi to dla pamięci.
+async function generateGroqCorrection(exerciseLabel, deviationLabel) {
+  if (!process.env.GROQ_API_KEY) throw new Error("Brak GROQ_API_KEY.");
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.4,
+      messages: [
+        { role: "system", content: POSTURE_COACH_STYLE_GUIDE },
+        {
+          role: "user",
+          content: `Ćwiczenie: ${exerciseLabel}\nWykryty błąd postawy: ${deviationLabel}\n\nPodaj JEDNO krótkie zdanie po polsku do powiedzenia na głos teraz. Tylko sama wypowiedź, bez cudzysłowów i bez wyjaśnień.`,
+        },
+      ],
+    }),
+  });
+  if (!response.ok) throw new Error(`Groq ${response.status}: ${await response.text()}`);
+  const completion = await response.json();
+  const text = completion?.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("Groq nie zwrócił tekstu korekty.");
+  return text;
+}
+
+// Symetryczne do generateGroqCorrection — pochwała zamiast korekty, gdy
+// wszystkie reguły ćwiczenia są spełnione (patrz affirmationDebouncer w
+// index.html). Ten sam styl-guide, ten sam fallback-first kontrakt.
+async function generateGroqAffirmation(exerciseLabel) {
+  if (!process.env.GROQ_API_KEY) throw new Error("Brak GROQ_API_KEY.");
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.4,
+      messages: [
+        { role: "system", content: POSTURE_COACH_STYLE_GUIDE },
+        {
+          role: "user",
+          content: `Ćwiczenie: ${exerciseLabel}\nUżytkownik trzyma tę pozycję poprawnie.\n\nPodaj JEDNO krótkie, ciepłe zdanie pochwały po polsku do powiedzenia na głos teraz. Tylko sama wypowiedź, bez cudzysłowów i bez wyjaśnień.`,
+        },
+      ],
+    }),
+  });
+  if (!response.ok) throw new Error(`Groq ${response.status}: ${await response.text()}`);
+  const completion = await response.json();
+  const text = completion?.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("Groq nie zwrócił tekstu pochwały.");
+  return text;
+}
 
 // ---- DOSTAWCY AWATARÓW ----
 // Każdy dostawca ma swoją funkcję getSessionToken() zwracającą co najmniej
@@ -255,6 +337,25 @@ jeśli mówi, że coś boli albo że musi kończyć, dostosuj się natychmiast.`
 // dropdownie i wysyła jego klucz w body POST /api/session-token. Dodanie
 // kolejnego dostawcy = nowy wpis tutaj + odpowiadający mu adapter w
 // ADAPTERS w index.html.
+//
+// Szkielet live-korekty postawy (patrz posture.js i /api/posture-correction
+// niżej) działa TYLKO dla providerów z LIVEAVATAR_PROVIDERS — obaj (liveavatar,
+// liveavatarGroq) to sesje FULL mode i współdzielą ten sam pokój LiveKit
+// (liveavatarRoom w index.html). Zweryfikowane bezpośrednio w
+// docs.liveavatar.com/docs/full-mode/events.md (stary URL z komentarza niżej,
+// "docs.liveavatar.com/docs/command-events", już nie istnieje — strona się
+// przeniosła):
+// - Komendy klient→awatar idą przez LiveKit data channel na topicu "agent-control".
+// - {"event_type":"avatar.speak_text","text":"..."} — awatar mówi DOKŁADNIE ten
+//   tekst, bez rundy przez LLM (to chcemy do natychmiastowej korekty; NIE
+//   "avatar.speak_response", który dokłada opóźnienie LLM-a).
+// - {"event_type":"avatar.interrupt"} (bez payloadu) — przerywa bieżącą wypowiedź.
+// Jeśli to, co jest na drugim komputerze, to faktycznie LiveAvatar LITE mode
+// (BYO ASR/TTS/wideo), a nie FULL + Custom TTS — LITE wg
+// docs.liveavatar.com/docs/lite-mode/events.md chodzi po OSOBNYM WebSocket,
+// nie po tym samym kanale LiveKit. Wtedy zmieni się tylko ostatnia mila
+// wysyłki (WebSocket zamiast publishData) — posture.js i endpoint niżej
+// zostają bez zmian.
 const PROVIDERS = {
   anam: {
     label: "Anam",
@@ -350,8 +451,11 @@ const PROVIDERS = {
     label: "HeyGen LiveAvatar (Full mode)",
     async getSessionToken() {
       const API_KEY = requireEnv("LIVEAVATAR_API_KEY");
-      const AVATAR_ID = "55eec60c-d665-4972-a529-bbdcaf665ab8"; // Bryan Fitness Coach (globalny)
-      const VOICE_ID = "9c8b542a-bf5c-4f4c-9011-75c79a274387";  // default_voice tego avatara (globalny)
+      const isSandbox = process.env.LIVEAVATAR_SANDBOX === "true";
+      // W sandboxie tylko Wayne działa (patrz SANDBOX_AVATAR_ID) — "Bryan
+      // Fitness Coach" daje 400 "This avatar is not supported in sandbox mode".
+      const AVATAR_ID = isSandbox ? SANDBOX_AVATAR_ID : "55eec60c-d665-4972-a529-bbdcaf665ab8"; // Bryan Fitness Coach (globalny) poza sandboxem
+      const VOICE_ID = isSandbox ? SANDBOX_VOICE_ID : "9c8b542a-bf5c-4f4c-9011-75c79a274387";  // default_voice tego avatara (globalny) poza sandboxem
       const CONTEXT_ID = "ac9b0086-8348-4caa-bf50-414ef00d36f7"; // Context "Yoga trainer" na TYM koncie
 
       const tokenRes = await fetch("https://api.liveavatar.com/v1/sessions/token", {
@@ -360,7 +464,7 @@ const PROVIDERS = {
         body: JSON.stringify({
           mode: "FULL",
           avatar_id: AVATAR_ID,
-          is_sandbox: false,
+          is_sandbox: process.env.LIVEAVATAR_SANDBOX === "true",
           interactivity_type: "CONVERSATIONAL",
           avatar_persona: {
             voice_id: VOICE_ID,
@@ -419,10 +523,13 @@ const PROVIDERS = {
     label: "LiveAvatar + Groq (własny LLM)",
     async getSessionToken() {
       const apiKey = requireEnv("LIVEAVATAR_API_KEY");
+      const isSandbox = process.env.LIVEAVATAR_SANDBOX === "true";
       // Te same publiczne zasoby są już sprawdzone w istniejącym providerze
-      // LiveAvatar Full. Można je opcjonalnie nadpisać w .env.
-      const avatarId = process.env.LIVEAVATAR_AVATAR_ID || "55eec60c-d665-4972-a529-bbdcaf665ab8";
-      const voiceId = process.env.LIVEAVATAR_VOICE_ID || "9c8b542a-bf5c-4f4c-9011-75c79a274387";
+      // LiveAvatar Full. Można je opcjonalnie nadpisać w .env. W sandboxie
+      // domyślnie przełącza się na Wayne'a (jedyny wspierany tam avatar) —
+      // patrz SANDBOX_AVATAR_ID.
+      const avatarId = process.env.LIVEAVATAR_AVATAR_ID || (isSandbox ? SANDBOX_AVATAR_ID : "55eec60c-d665-4972-a529-bbdcaf665ab8");
+      const voiceId = process.env.LIVEAVATAR_VOICE_ID || (isSandbox ? SANDBOX_VOICE_ID : "9c8b542a-bf5c-4f4c-9011-75c79a274387");
       const groqApiKey = requireEnv("GROQ_API_KEY");
 
       // Poniższe zasoby są tworzone tylko, gdy nie istnieją w koncie. To
@@ -682,6 +789,74 @@ const server = http.createServer(async (req, res) => {
       }));
     } catch (e) {
       console.error("Błąd Session Recorder:", e.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Rejestr ćwiczeń/odchyleń do zbudowania panelu debug w UI (patrz posture.js).
+  if (req.method === "GET" && req.url === "/api/posture-cues") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ exercises: listExerciseCues() }));
+    return;
+  }
+
+  // Zwraca tekst korekty dla danego ćwiczenia/odchylenia. exercise/deviation
+  // przychodzą z pose-detector.js (reguły geometryczne + debouncer w
+  // index.html), które ćwiczenie jest aktualne wykrywa detectActiveExercise()
+  // z transkrypcji rozmowy. Tekst generuje Groq (generateGroqCorrection,
+  // patrz wyżej); jeśli to zawiedzie (brak klucza, błąd sieci, timeout), leci
+  // fallback z posture.js — korekta nigdy nie milczy, tylko brzmi sztywniej.
+  if (req.method === "POST" && req.url === "/api/posture-correction") {
+    try {
+      const body = await readJsonBody(req);
+      const cue = buildPostureCue(body.exercise, body.deviation);
+      if (!cue) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Nieznana kombinacja exercise/deviation: ${body.exercise}/${body.deviation}` }));
+        return;
+      }
+      let source = "fallback";
+      try {
+        cue.text = await generateGroqCorrection(cue.exerciseLabel, cue.deviationLabel);
+        source = "groq";
+      } catch (groqError) {
+        console.warn("Posture Correction: Groq nie odpowiedział, używam fallbacku:", groqError.message);
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...cue, source }));
+    } catch (e) {
+      console.error("Błąd Posture Correction:", e.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Symetryczne do /api/posture-correction — pochwała zamiast korekty, gdy
+  // affirmationDebouncer w index.html potwierdzi, że wszystkie reguły danego
+  // ćwiczenia są spełnione przez dłuższą chwilę. Ten sam fallback-first wzorzec.
+  if (req.method === "POST" && req.url === "/api/posture-affirmation") {
+    try {
+      const body = await readJsonBody(req);
+      const affirmation = buildPostureAffirmation(body.exercise);
+      if (!affirmation) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Nieznane exercise: ${body.exercise}` }));
+        return;
+      }
+      let source = "fallback";
+      try {
+        affirmation.text = await generateGroqAffirmation(affirmation.exerciseLabel);
+        source = "groq";
+      } catch (groqError) {
+        console.warn("Posture Affirmation: Groq nie odpowiedział, używam fallbacku:", groqError.message);
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...affirmation, source }));
+    } catch (e) {
+      console.error("Błąd Posture Affirmation:", e.message);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
     }

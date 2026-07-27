@@ -25,6 +25,7 @@
   czas reakcji.</p>
 
   <video id="persona-video" autoplay playsinline></video>
+  <button id="audio-unlock-btn" style="display: none; background: #ffcc00; color: #1a1a1a; font-weight: 600;">🔊 Nie słychać avatara? Kliknij, żeby włączyć dźwięk</button>
 
   <div>
     <label for="provider">Dostawca:</label>
@@ -36,6 +37,22 @@
     <button id="stop" disabled>Stop</button>
   </div>
 
+  <fieldset>
+    <legend>Korekta postawy na żywo (tylko LiveAvatar Full/Groq, aktywna sesja)</legend>
+    <p class="hint">Ćwiczenie wykrywane jest automatycznie z rozmowy (co powie avatar albo Ty) —
+    nie trzeba nic wybierać ręcznie. Kamera włącza się wyłącznie po kliknięciu.</p>
+    <p id="active-exercise-status" class="hint"><strong>Wykryte ćwiczenie:</strong> brak — czekam, aż zostanie przydzielone w rozmowie.</p>
+    <label for="camera-device">Kamera:</label>
+    <select id="camera-device"><option value="">(domyślna)</option></select>
+    <div id="camera-wrap" style="position: relative; width: 480px; max-width: 100%; background: #000; border-radius: 12px; overflow: hidden; transform: scaleX(-1);">
+      <video id="user-camera" muted playsinline style="width: 100%; height: auto; display: block;"></video>
+      <canvas id="pose-canvas" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></canvas>
+    </div>
+    <p class="hint">Pomarańczowe punkty = landmarki, które faktycznie zasila reguła aktualnego
+    ćwiczenia. Podgląd lustrzany (jak w lustrze) — tylko wizualnie, na liczenie kątów nie wpływa.</p>
+    <button id="pose-camera-toggle">Włącz kamerę i auto-korektę</button>
+  </fieldset>
+
   <div id="log">— log zdarzeń —</div>
   <div id="provider-output">— surowy output providerów (tokeny zamaskowane) —</div>
   <div id="database-log">— monitor Session Recorder / Supabase —</div>
@@ -44,6 +61,7 @@
     import { createClient, AnamEvent } from "https://esm.sh/@anam-ai/js-sdk@latest";
     import { Room, RoomEvent } from "https://esm.sh/livekit-client@2";
     import Daily from "https://esm.sh/@daily-co/daily-js";
+    import { createPoseDetector, RULES, createDeviationDebouncer, drawLandmarks, HIGHLIGHT_INDICES } from "./pose-detector.js";
 
     const startBtn = document.getElementById("start");
     const stopBtn = document.getElementById("stop");
@@ -58,6 +76,25 @@
       logEl.textContent += `\n[${t0()}] ${msg}`;
       logEl.scrollTop = logEl.scrollHeight;
       console.log(`[${t0()}] ${msg}`);
+    }
+
+    // Przeglądarki blokują autoplay DŹWIĘKU niezależnie od wideo (dlatego usta
+    // się ruszają, a głosu brak) — to dotyka LiveAvatar i Tavus (patrz oba
+    // miejsca użycia niżej). Wcześniej jedynym sygnałem był wpis w logu +
+    // niewidoczny nasłuch na "kliknij gdziekolwiek" — łatwo przegapić, stąd
+    // "czasem się nie podłącza". Widoczny przycisk jest trudniejszy do przeoczenia.
+    const audioUnlockBtn = document.getElementById("audio-unlock-btn");
+    function showAudioUnlock(resumePlayback) {
+      audioUnlockBtn.style.display = "inline-block";
+      audioUnlockBtn.onclick = () => {
+        resumePlayback().then(() => {
+          log("Dźwięk włączony.");
+          audioUnlockBtn.style.display = "none";
+        });
+      };
+    }
+    function hideAudioUnlock() {
+      audioUnlockBtn.style.display = "none";
     }
 
     function sanitizeProviderOutput(value) {
@@ -129,6 +166,10 @@
       } catch (e) {
         return null;
       }
+    }
+
+    function encodeDataMessage(obj) {
+      return new TextEncoder().encode(JSON.stringify(obj));
     }
 
     async function getProviderSession(provider) {
@@ -206,6 +247,63 @@
         });
     }
 
+    // Szkielet live-korekty postawy: dziś exercise/deviation przychodzą z
+    // ręcznie wybranych dropdownów w panelu debug, docelowo z prawdziwej
+    // detekcji pozy (kamera + landmarki). Wysyłka działa tylko dla FULL-mode
+    // providerów LiveAvatar, które współdzielą liveavatarRoom (patrz komentarz
+    // przy PROVIDERS w server.js — topic "agent-control", avatar.speak_text
+    // vs avatar.speak_response, avatar.interrupt).
+    async function sendPostureCue(exercise, deviation, { interrupt = true } = {}) {
+      if (!liveavatarRoom) {
+        log("Korekta postawy działa tylko przy aktywnej sesji LiveAvatar Full/Groq.");
+        return;
+      }
+      const res = await fetch("/api/posture-correction", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ exercise, deviation }),
+      });
+      const data = await res.json().catch(() => ({}));
+      logProviderOutput(liveavatarProviderKey, `HTTP /api/posture-correction (${res.status})`, data);
+      if (!res.ok) {
+        log(`BŁĄD korekty postawy: ${data.error || res.status}`);
+        return;
+      }
+      if (interrupt) {
+        await liveavatarRoom.localParticipant.publishData(
+          encodeDataMessage({ event_type: "avatar.interrupt" }),
+          { reliable: true, topic: "agent-control" }
+        );
+      }
+      await liveavatarRoom.localParticipant.publishData(
+        encodeDataMessage({ event_type: "avatar.speak_text", text: data.text }),
+        { reliable: true, topic: "agent-control" }
+      );
+      log(`KOREKTA POSTAWY [źródło: ${data.source || "?"}] wysłana: "${data.text}"`);
+    }
+
+    // Symetryczne do sendPostureCue — pochwała zamiast korekty. Domyślnie nie
+    // przerywa bieżącej wypowiedzi (to nie jest pilne, w przeciwieństwie do korekty).
+    async function sendPostureAffirmation(exercise) {
+      if (!liveavatarRoom) return;
+      const res = await fetch("/api/posture-affirmation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ exercise }),
+      });
+      const data = await res.json().catch(() => ({}));
+      logProviderOutput(liveavatarProviderKey, `HTTP /api/posture-affirmation (${res.status})`, data);
+      if (!res.ok) {
+        log(`BŁĄD pochwały postawy: ${data.error || res.status}`);
+        return;
+      }
+      await liveavatarRoom.localParticipant.publishData(
+        encodeDataMessage({ event_type: "avatar.speak_text", text: data.text }),
+        { reliable: true, topic: "agent-control" }
+      );
+      log(`POCHWAŁA POSTAWY [źródło: ${data.source || "?"}] wysłana: "${data.text}"`);
+    }
+
     const ADAPTERS = {
       anam: {
         async connect(videoElId) {
@@ -271,6 +369,18 @@
           liveavatarRoom.on(RoomEvent.TrackSubscribed, (track) => {
             log(`LiveKit: nowy track (${track.kind}) od awatara — podpinam do wideo.`);
             track.attach(liveavatarVideoEl);
+            // Sprawdzenie TUTAJ, w momencie podłączenia audio-tracka, jest
+            // bardziej niezawodne niż samo poleganie na
+            // AudioPlaybackStatusChanged niżej — ten event nie zawsze odpala
+            // się przy blokadzie obecnej od samego początku (brak "zmiany"
+            // stanu, z którego by wystartował).
+            if (track.kind === "audio") {
+              log(`LiveKit: audio track podłączony. canPlaybackAudio=${liveavatarRoom.canPlaybackAudio}`);
+              if (!liveavatarRoom.canPlaybackAudio) {
+                log("⚠️ Dźwięk zablokowany od razu po podłączeniu audio-tracka.");
+                showAudioUnlock(() => liveavatarRoom.startAudio());
+              }
+            }
           });
           liveavatarRoom.on(RoomEvent.TrackUnsubscribed, (track) => {
             track.detach(liveavatarVideoEl);
@@ -283,13 +393,12 @@
           // nie było ŻADNEGO śladu w logu, dlatego wyglądało to jak losowy
           // brak dźwięku bez przyczyny.
           liveavatarRoom.on(RoomEvent.AudioPlaybackStatusChanged, () => {
-            if (liveavatarRoom.canPlaybackAudio) return;
-            log("⚠️ Przeglądarka zablokowała autoplay dźwięku. Kliknij gdziekolwiek na stronie, żeby go włączyć.");
-            const resume = () => {
-              liveavatarRoom.startAudio().then(() => log("Dźwięk włączony."));
-              document.removeEventListener("click", resume);
-            };
-            document.addEventListener("click", resume);
+            if (liveavatarRoom.canPlaybackAudio) {
+              hideAudioUnlock();
+              return;
+            }
+            log("⚠️ Przeglądarka zablokowała autoplay dźwięku. Kliknij żółty przycisk 'Włącz dźwięk' nad logiem.");
+            showAudioUnlock(() => liveavatarRoom.startAudio());
           });
           liveavatarRoom.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
             const msg = decodeDataMessage(payload);
@@ -301,10 +410,12 @@
             if (msg.event_type === "user.transcription") {
               log(`TY: ${msg.text}`);
               recordLiveAvatarEvent(msg.event_type, msg);
+              detectActiveExercise(msg.text);
             }
             else if (msg.event_type === "avatar.transcription") {
               log(`AWATAR: ${msg.text}`);
               recordLiveAvatarEvent(msg.event_type, msg);
+              detectActiveExercise(msg.text);
             }
             else if (msg.event_type === "user.speak_started") log("Zaczynasz mówić...");
             else if (msg.event_type === "user.speak_ended") {
@@ -332,6 +443,13 @@
           log("Połączono z pokojem. Włączam mikrofon...");
           await liveavatarRoom.localParticipant.setMicrophoneEnabled(true);
           log("Mikrofon aktywny. Mów!");
+          // Trzecie, jeszcze jedno sprawdzenie na koniec connect() — na
+          // wypadek gdyby żaden z dwóch handlerów wyżej się nie odpalił
+          // (np. audio track przyszedł zanim zdążyliśmy podpiąć listenery).
+          if (!liveavatarRoom.canPlaybackAudio) {
+            log("⚠️ Dźwięk zablokowany (sprawdzone po zakończeniu łączenia).");
+            showAudioUnlock(() => liveavatarRoom.startAudio());
+          }
         },
         async disconnect() {
           if (liveavatarRoom) {
@@ -397,12 +515,8 @@
             // jawnie, żeby to wyłapać i dać możliwość ręcznego wznowienia.
             tavusVideoEl.play().catch((e) => {
               if (e.name !== "NotAllowedError") return;
-              log("⚠️ Przeglądarka zablokowała autoplay dźwięku. Kliknij gdziekolwiek na stronie, żeby go włączyć.");
-              const resume = () => {
-                tavusVideoEl.play().then(() => log("Dźwięk włączony."));
-                document.removeEventListener("click", resume);
-              };
-              document.addEventListener("click", resume);
+              log("⚠️ Przeglądarka zablokowała autoplay dźwięku. Kliknij żółty przycisk 'Włącz dźwięk' nad logiem.");
+              showAudioUnlock(() => tavusVideoEl.play());
             });
           });
           tavusCall.on("left-meeting", () => log("Daily: opuszczono spotkanie."));
@@ -465,6 +579,184 @@
       if (saved && providers.some((p) => p.key === saved)) providerSelect.value = saved;
     }
     loadProviders();
+
+    // Ćwiczenie, które aktualnie trwa, jest wykrywane z transkrypcji rozmowy
+    // (i usera, i avatara) — dopasowanie słów kluczowych, nie LLM: przy tylko
+    // 2 wyraźnie odrębnych nazwach po polsku to błyskawiczne i tak samo
+    // niezawodne jak klasyfikacja przez LLM, więc LLM byłby zbędnym narzutem
+    // (ta sama zasada co przy regułach kątowych zamiast LLM-a do detekcji).
+    const activeExerciseStatusEl = document.getElementById("active-exercise-status");
+    let postureExercises = [];
+    let activeExercise = null;
+    let lastExerciseSwitchAt = 0;
+    // LiveKit potrafi dostarczać transcription eventy fragmentami (np. osobno
+    // "Pozycję", "dziecka", "zrobimy") zamiast jednej pełnej wypowiedzi —
+    // sprawdzanie tylko pojedynczej, najświeższej wiadomości przegapiało frazę
+    // rozbitą na kawałki. Dlatego dopasowanie leci po narastającym buforze
+    // ostatnich ~300 znaków, nie po pojedynczym `text`.
+    let recentTranscriptBuffer = "";
+
+    async function loadPostureCues() {
+      const res = await fetch("/api/posture-cues");
+      const { exercises } = await res.json();
+      postureExercises = exercises;
+    }
+    loadPostureCues();
+
+    function detectActiveExercise(text) {
+      if (!text) return;
+      recentTranscriptBuffer = `${recentTranscriptBuffer} ${text}`.toLowerCase().slice(-300);
+      const match = postureExercises.find((exercise) => exercise.keywords.some((kw) => recentTranscriptBuffer.includes(kw)));
+      if (!match || match.key === activeExercise) return;
+      activeExercise = match.key;
+      lastExerciseSwitchAt = performance.now();
+      activeExerciseStatusEl.innerHTML = `<strong>Wykryte ćwiczenie:</strong> ${match.label}`;
+      log(`Auto-detekcja ćwiczenia: "${match.label}" (z transkrypcji).`);
+    }
+
+    // Auto-detekcja (PoC): kamera + MediaPipe Pose, tylko reguły dla
+    // ćwiczenia wykrytego z rozmowy (patrz detectActiveExercise wyżej).
+    // Potwierdzone przez debouncer odchylenie leci przez sendPostureCue;
+    // sustained brak odchyleń leci przez sendPostureAffirmation.
+    const userCameraVideo = document.getElementById("user-camera");
+    const poseCanvas = document.getElementById("pose-canvas");
+    const poseCanvasCtx = poseCanvas.getContext("2d");
+    const poseCameraToggleBtn = document.getElementById("pose-camera-toggle");
+    const cameraDeviceSelect = document.getElementById("camera-device");
+    const postureDebouncer = createDeviationDebouncer({ sustainMs: 1000, cooldownMs: 15000 });
+    // Dłuższy sustain (3.5s) niż korekta (1s) — inaczej pochwała i korekta
+    // migałyby na przemian przy niepewnych, granicznych wartościach. Dłuższy
+    // cooldown (25s) — pochwała nie musi (i nie powinna) powtarzać się co chwilę.
+    const affirmationDebouncer = createDeviationDebouncer({ sustainMs: 3500, cooldownMs: 25000 });
+    // Po przełączeniu ćwiczenia dajemy userowi chwilę na wejście w pozycję,
+    // zanim reguły zaczną wyzwalać korekty/pochwały — inaczej system zdążyłby
+    // krzyczeć korektę, zanim user w ogóle spróbuje danej pozycji. To łagodzi,
+    // ale nie rozwiązuje w pełni problemu "czy user w ogóle jest w tej
+    // pozycji" — nie mamy klasyfikatora pozy, tylko reguły zakładające, że
+    // dana pozycja jest już wykonywana. Świadome ograniczenie "namiastki".
+    const EXERCISE_SWITCH_GRACE_MS = 4000;
+    let poseDetector = null;
+    let userCameraStream = null;
+
+    // Etykiety urządzeń (nazwy kamer) są dostępne dopiero PO udzieleniu
+    // zgody na kamerę choć raz — wcześniej przeglądarka pokazuje je puste.
+    // Dlatego odświeżamy listę też po udanym getUserMedia.
+    async function populateCameraDevices() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter((d) => d.kind === "videoinput");
+      const previousValue = cameraDeviceSelect.value;
+      cameraDeviceSelect.innerHTML = '<option value="">(domyślna)</option>';
+      cameras.forEach((cam, i) => {
+        const opt = document.createElement("option");
+        opt.value = cam.deviceId;
+        opt.textContent = cam.label || `Kamera ${i + 1}`;
+        cameraDeviceSelect.appendChild(opt);
+      });
+      if (cameras.some((c) => c.deviceId === previousValue)) cameraDeviceSelect.value = previousValue;
+    }
+    populateCameraDevices();
+    navigator.mediaDevices.addEventListener?.("devicechange", populateCameraDevices);
+
+    // NotReadableError = przeglądarka widzi kamerę (ma permission), ale
+    // system/sterownik nie pozwolił jej faktycznie otworzyć — najczęściej
+    // inny program/karta trzyma ją zajętą, albo przeglądarka wciąż próbuje
+    // otworzyć już nieistniejące (usunięte) urządzenie zapamiętane dla tej
+    // strony. Reset uprawnień kamery dla strony + odświeżenie zwykle pomaga.
+    function describeCameraError(e) {
+      if (e.name === "NotAllowedError" || e.name === "PermissionDeniedError")
+        return "Brak zgody na kamerę — sprawdź uprawnienia witryny w przeglądarce.";
+      if (e.name === "NotFoundError" || e.name === "DevicesNotFoundError")
+        return "Nie znaleziono wybranej kamery — odśwież listę albo wybierz inną.";
+      if (e.name === "NotReadableError" || e.name === "TrackStartError")
+        return "Kamera zajęta przez inny program/kartę, albo przeglądarka próbuje otworzyć usunięte urządzenie — zamknij inne aplikacje używające kamery, ewentualnie zresetuj uprawnienia kamery dla tej strony (kłódka przy adresie) i odśwież.";
+      if (e.name === "OverconstrainedError")
+        return "Wybrana kamera nie obsługuje żądanych parametrów — wybierz inną z listy.";
+      return e.message;
+    }
+
+    async function enableCameraAutoCorrection() {
+      poseCameraToggleBtn.disabled = true;
+      try {
+        log("Auto-korekta: proszę o dostęp do kamery...");
+        const deviceId = cameraDeviceSelect.value;
+        const constraints = deviceId ? { video: { deviceId: { exact: deviceId } } } : { video: true };
+        userCameraStream = await navigator.mediaDevices.getUserMedia(constraints);
+        await populateCameraDevices();
+        userCameraVideo.srcObject = userCameraStream;
+        await userCameraVideo.play();
+        // Canvas musi rysować w rozdzielczości natywnej klatki wideo (nie w
+        // rozmiarze CSS-owego pudełka) — landmarki z MediaPipe są znormalizowane
+        // 0-1 względem oryginalnej klatki, więc inaczej punkty by "pływały".
+        poseCanvas.width = userCameraVideo.videoWidth;
+        poseCanvas.height = userCameraVideo.videoHeight;
+        log("Auto-korekta: ładuję MediaPipe Pose (lite)...");
+        poseDetector = await createPoseDetector(userCameraVideo, (landmarks) => {
+          const exercise = activeExercise;
+          const rules = exercise ? RULES[exercise] : null;
+          drawLandmarks(poseCanvasCtx, landmarks, {
+            width: poseCanvas.width,
+            height: poseCanvas.height,
+            highlightIndices: exercise ? HIGHLIGHT_INDICES[exercise] || [] : [],
+          });
+          if (!exercise) {
+            poseCanvasCtx.save();
+            poseCanvasCtx.scale(-1, 1);
+            poseCanvasCtx.font = "14px monospace";
+            poseCanvasCtx.fillStyle = "#00dc78";
+            poseCanvasCtx.fillText("czekam na przydzielenie ćwiczenia w rozmowie...", -poseCanvas.width + 8, 16);
+            poseCanvasCtx.restore();
+            return;
+          }
+          if (!rules) return;
+          const inGracePeriod = performance.now() - lastExerciseSwitchAt < EXERCISE_SWITCH_GRACE_MS;
+          let readoutY = 16;
+          let allClear = true;
+          for (const [deviation, check] of Object.entries(rules)) {
+            const result = check(landmarks);
+            if (result.active) allClear = false;
+            poseCanvasCtx.save();
+            poseCanvasCtx.scale(-1, 1); // canvas jest w lustrzanym #camera-wrap — tekst trzeba odbić z powrotem, żeby dało się go czytać
+            poseCanvasCtx.font = "14px monospace";
+            poseCanvasCtx.fillStyle = result.active ? "#ff9800" : "#00dc78";
+            poseCanvasCtx.fillText(`${result.label}: ${result.value ?? "?"}`, -poseCanvas.width + 8, readoutY);
+            poseCanvasCtx.restore();
+            readoutY += 18;
+            if (inGracePeriod) continue; // reguły widoczne w podglądzie, ale jeszcze nie wyzwalają korekty
+            const confirmed = postureDebouncer.check(`${exercise}:${deviation}`, result.active);
+            if (confirmed) {
+              log(`Auto-korekta: wykryto "${deviation}" dla "${exercise}".`);
+              sendPostureCue(exercise, deviation, { interrupt: true });
+            }
+          }
+          if (!inGracePeriod && affirmationDebouncer.check(exercise, allClear)) {
+            log(`Auto-korekta: postawa poprawna dla "${exercise}".`);
+            sendPostureAffirmation(exercise);
+          }
+        });
+        log("Auto-korekta: aktywna.");
+        poseCameraToggleBtn.textContent = "Wyłącz kamerę i auto-korektę";
+        poseCameraToggleBtn.onclick = disableCameraAutoCorrection;
+      } catch (e) {
+        log(`BŁĄD auto-korekty (${e.name || "?"}): ${describeCameraError(e)}`);
+        if (userCameraStream) userCameraStream.getTracks().forEach((track) => track.stop());
+        userCameraStream = null;
+      } finally {
+        poseCameraToggleBtn.disabled = false;
+      }
+    }
+
+    function disableCameraAutoCorrection() {
+      if (poseDetector) poseDetector.stop();
+      poseDetector = null;
+      if (userCameraStream) userCameraStream.getTracks().forEach((track) => track.stop());
+      userCameraStream = null;
+      userCameraVideo.srcObject = null;
+      poseCanvasCtx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+      log("Auto-korekta: wyłączona.");
+      poseCameraToggleBtn.textContent = "Włącz kamerę i auto-korektę";
+      poseCameraToggleBtn.onclick = enableCameraAutoCorrection;
+    }
+    poseCameraToggleBtn.onclick = enableCameraAutoCorrection;
 
     startBtn.onclick = async () => {
       startBtn.disabled = true;
