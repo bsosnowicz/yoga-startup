@@ -53,6 +53,28 @@
     <button id="pose-camera-toggle">Włącz kamerę i auto-korektę</button>
   </fieldset>
 
+  <fieldset id="calibration-panel" style="display: none; border-color: #ffcc00;">
+    <legend>Tryb kalibracyjny (?calibrate=1)</legend>
+    <p class="hint">Nagrywa wzorcowe pozycje do plików calibration/*.json — dane treningowe
+    klasyfikatora k-NN. Wymaga włączonej kamery (przycisk wyżej). 5s odliczania na przyjęcie
+    pozycji, potem 10s zbierania danych.</p>
+    <label for="calibration-pose-select">Pozycja:</label>
+    <select id="calibration-pose-select"></select>
+    <div id="calibration-new-pose-fields" style="display: none; margin-top: 8px;">
+      <label for="calibration-new-pose-id">Nowe id (np. savasana):</label>
+      <input id="calibration-new-pose-id" type="text" />
+      <label for="calibration-new-pose-label">Nazwa (np. Savasana):</label>
+      <input id="calibration-new-pose-label" type="text" />
+    </div>
+    <div style="margin-top: 8px;">
+      <label><input type="radio" name="calibration-variant" value="pelna" checked /> Pełna</label>
+      <label><input type="radio" name="calibration-variant" value="zlagodzona" /> Złagodzona</label>
+    </div>
+    <button id="calibration-record-btn" style="margin-top: 8px;">Nagraj</button>
+    <p id="calibration-status" class="hint"></p>
+    <pre id="calibration-summary" style="display:none; background:#fff; border:1px solid #e5e5e5; border-radius:8px; padding:12px; font-size:0.8rem; overflow-x:auto;"></pre>
+  </fieldset>
+
   <div id="log">— log zdarzeń —</div>
   <div id="provider-output">— surowy output providerów (tokeny zamaskowane) —</div>
   <div id="database-log">— monitor Session Recorder / Supabase —</div>
@@ -61,7 +83,10 @@
     import { createClient, AnamEvent } from "https://esm.sh/@anam-ai/js-sdk@latest";
     import { Room, RoomEvent } from "https://esm.sh/livekit-client@2";
     import Daily from "https://esm.sh/@daily-co/daily-js";
-    import { createPoseDetector, RULES, createDeviationDebouncer, drawLandmarks, HIGHLIGHT_INDICES } from "./pose-detector.js";
+    import { createPoseDetector, evaluateRule, createValueSmoother, createDeviationDebouncer, drawLandmarks, summarizeCalibrationAngles } from "./pose-detector.js";
+    import { RULES, HIGHLIGHT_INDICES } from "./posture-rules.js";
+    import { createKnnClassifier } from "./knn.js";
+    import { createPostureStateMachine } from "./posture-state-machine.js";
 
     const startBtn = document.getElementById("start");
     const stopBtn = document.getElementById("stop");
@@ -173,6 +198,29 @@
     let liteAvatarSpeaking = false;
     let liteAvatarSpeakingStartedAt = 0;
     let liteSpeechEndedAt = null;
+    let liteLastAvatarUtterance = ""; // do wykrywania echa własnego głosu awatara w mikrofonie, patrz isLikelyEcho niżej
+
+    // Bez słuchawek głos awatara leci z głośników z powrotem do mikrofonu —
+    // Web Speech API potrafi to usłyszeć jako wypowiedź użytkownika i
+    // przerwać awatara jego własnymi słowami, a potem wysłać ten
+    // (zniekształcony przez STT) tekst jako "user turn" do Groq, który
+    // odpowiada na coś zupełnie nie na temat — to źródło zgłoszonego "sam
+    // sobie przerywa i mówi coś nie związanego z tematem". Bufor 600ms przy
+    // liteAvatarSpeakingStartedAt (patrz onresult niżej) łapie tylko START
+    // tego echa; dopóki awatar mówi dalej, mikrofon wciąż słyszy resztę tej
+    // samej wypowiedzi, więc dodatkowo porównujemy usłyszany tekst z tym, co
+    // awatar faktycznie właśnie mówi (liteLastAvatarUtterance, aktualizowane
+    // z SSE avatar_transcription) — przy dużym pokryciu słów to echo, nie
+    // realna wypowiedź użytkownika.
+    function isLikelyEcho(heardText, avatarText) {
+      if (!avatarText) return false;
+      const words = (s) => s.toLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
+      const heardWords = words(heardText);
+      if (heardWords.length < 2) return false; // zbyt krótkie, by bezpiecznie odróżnić od realnego "stop"/"czekaj"
+      const avatarWords = new Set(words(avatarText));
+      const overlap = heardWords.filter((w) => avatarWords.has(w)).length;
+      return overlap / heardWords.length >= 0.6;
+    }
 
     function decodeDataMessage(payload) {
       try {
@@ -327,6 +375,38 @@
         );
       }
       log(`POCHWAŁA POSTAWY [źródło: ${data.source || "?"}] wysłana: "${data.text}"`);
+    }
+
+    // Komunikat "rozjazd pozycji" — wołane z posture-state-machine.js (stan
+    // MISMATCH) przez onFrame niżej. Kopia sendPostureCue: zawsze
+    // interrupt:true (najwyższy priorytet — patrz plan). W trybie Lite
+    // priorytet/przerywanie w toku wypowiedzi obsługuje w całości
+    // speakLiteCue()/session.turnInFlight po stronie serwera (server.js) —
+    // front-end tu nic nie musi koordynować poza wysłaniem requestu.
+    async function sendPostureMismatchCue(targetKey, detectedKey) {
+      if (!liveavatarRoom && !liteSessionId) return;
+      const res = await fetch("/api/posture-mismatch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: targetKey, detected: detectedKey, sessionId: liteSessionId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      logProviderOutput(liveavatarProviderKey || "liveavatarLiteEleven", `HTTP /api/posture-mismatch (${res.status})`, data);
+      if (!res.ok) {
+        log(`BŁĄD komunikatu rozjazdu: ${data.error || res.status}`);
+        return;
+      }
+      if (liveavatarRoom) {
+        await liveavatarRoom.localParticipant.publishData(
+          encodeDataMessage({ event_type: "avatar.interrupt" }),
+          { reliable: true, topic: "agent-control" }
+        );
+        await liveavatarRoom.localParticipant.publishData(
+          encodeDataMessage({ event_type: "avatar.speak_text", text: data.text }),
+          { reliable: true, topic: "agent-control" }
+        );
+      }
+      log(`ROZJAZD POZYCJI [źródło: ${data.source || "?"}] wysłano: "${data.text}"`);
     }
 
     const ADAPTERS = {
@@ -643,6 +723,10 @@
             else if (data.stage === "avatar_speak_started") {
               liteAvatarSpeaking = true;
               liteAvatarSpeakingStartedAt = performance.now();
+              // Czyścimy tekst POPRZEDNIEJ wypowiedzi — avatar_transcription
+              // dla TEJ wypowiedzi dojdzie chwilę później (patrz niżej), nie
+              // chcemy w międzyczasie porównywać nowego echa ze starym tekstem.
+              liteLastAvatarUtterance = "";
               // ms tutaj jest liczony na tym samym zegarze (backend,
               // session.turnStartedAt) co "Audio wysłane do LiveAvatar" —
               // różnica tych dwóch liczb to dokładny narzut samego
@@ -661,6 +745,7 @@
             // avatar, nie tylko usera.
             else if (data.stage === "avatar_transcription") {
               log(`AWATAR: ${data.text}`);
+              liteLastAvatarUtterance = data.text || "";
               detectActiveExercise(data.text);
             }
           };
@@ -694,6 +779,18 @@
           liteRecognition.onspeechend = () => { liteSpeechEndedAt = performance.now(); };
           liteRecognition.onresult = (ev) => {
             clearTimeout(liteSpeechWatchdog);
+            const result = ev.results[ev.results.length - 1];
+            const heard = result[0].transcript.trim();
+            // Patrz definicja isLikelyEcho wyżej: dopóki awatar mówi, to co
+            // "usłyszał" mikrofon może być echem jego własnego głosu z
+            // głośników, nie prawdziwą wypowiedzią użytkownika. Jeśli tekst
+            // w większości pokrywa się z tym, co avatar właśnie mówi —
+            // ignorujemy: bez tego takie echo wywoływało barge-in i leciało
+            // dalej jako "user turn" do Groq.
+            if (liteAvatarSpeaking && isLikelyEcho(heard, liteLastAvatarUtterance)) {
+              if (result.isFinal) log("(Zignorowano echo własnego głosu awatara w mikrofonie.)");
+              return;
+            }
             // Barge-in: sprawdzamy na KAŻDYM wyniku (nawet cząstkowym), nie
             // tylko w onspeechstart — w trybie continuous Chrome odpala
             // onspeechstart tylko raz dla pierwszej wypowiedzi w całej
@@ -714,9 +811,8 @@
                 body: JSON.stringify({ sessionId }),
               }).catch((e) => log(`(Nie udało się przerwać: ${e.message})`));
             }
-            const result = ev.results[ev.results.length - 1];
             if (!result.isFinal) return;
-            const text = result[0].transcript.trim();
+            const text = heard;
             if (!text) return;
             log(`TY: ${text}`);
             detectActiveExercise(text);
@@ -819,6 +915,15 @@
       if (!match || match.key === activeExercise) return;
       activeExercise = match.key;
       lastExerciseSwitchAt = performance.now();
+      // Zeruje bufory wygładzania (patrz valueSmoother niżej) — inaczej
+      // powrót do TEGO SAMEGO ćwiczenia po przerwie mieszałby świeże wartości
+      // ze stale'owymi z poprzedniej sesji tej pozycji.
+      valueSmoother.reset();
+      // Nowe zadanie pozycji resetuje maszynę stanów do WCHODZENIE — patrz
+      // posture-state-machine.js (setTarget). Bezpieczne wywołanie nawet gdy
+      // k-NN nie ma danych (knnClassifier.isReady()===false): stan po prostu
+      // nigdy nie ruszy się z ENTERING, bo nic nie woła update().
+      postureStateMachine.setTarget(match.key, performance.now());
       activeExerciseStatusEl.innerHTML = `<strong>Wykryte ćwiczenie:</strong> ${match.label}`;
       log(`Auto-detekcja ćwiczenia: "${match.label}" (z transkrypcji).`);
     }
@@ -832,6 +937,11 @@
     const poseCanvasCtx = poseCanvas.getContext("2d");
     const poseCameraToggleBtn = document.getElementById("pose-camera-toggle");
     const cameraDeviceSelect = document.getElementById("camera-device");
+    // Wygładza surową wartość (kąt/ratio) w oknie 5 klatek PRZED oceną
+    // reguły — osobny mechanizm od debounce'ów niżej, które wygładzają w
+    // czasie już gotowy wynik bool. Reset przy zmianie ćwiczenia w
+    // detectActiveExercise() wyżej.
+    const valueSmoother = createValueSmoother();
     const postureDebouncer = createDeviationDebouncer({ sustainMs: 1000, cooldownMs: 15000 });
     // Dłuższy sustain (3.5s) niż korekta (1s) — inaczej pochwała i korekta
     // migałyby na przemian przy niepewnych, granicznych wartościach. Dłuższy
@@ -846,6 +956,40 @@
     const EXERCISE_SWITCH_GRACE_MS = 4000;
     let poseDetector = null;
     let userCameraStream = null;
+
+    // k-NN: rozpoznaje SAMĄ pozycję z landmarków, niezależnie od tego, co
+    // powiedział trener — patrz knn.js. isReady()===false dopóki nie ma
+    // żadnej kalibracji (calibration/ puste) -> cały tor w onFrame niżej się
+    // nie wykonuje (graceful degradation, zero zmiany zachowania).
+    const knnClassifier = createKnnClassifier();
+    const postureStateMachine = createPostureStateMachine();
+    const KNN_CLASSIFY_EVERY_N_FRAMES = 12; // ~30fps -> ~2.5x/s, throttling narzutu k-NN
+    let knnFrameCounter = 0;
+    let lastKnnClassification = null;
+    let knnClassifyTicks = 0;
+    let knnFreqLogAt = 0;
+
+    async function loadCalibrationData() {
+      try {
+        const res = await fetch("/api/calibration");
+        const { calibrations } = await res.json();
+        const { sampleCount, labelNames } = knnClassifier.loadTrainingData(calibrations);
+        log(
+          sampleCount > 0
+            ? `k-NN: załadowano ${sampleCount} próbek kalibracji (${labelNames.join(", ")}).`
+            : "k-NN: brak danych kalibracyjnych — klasyfikacja pozycji wyłączona (reguły kątowe działają normalnie)."
+        );
+      } catch (e) {
+        log(`k-NN: nie udało się załadować kalibracji (${e.message}) — klasyfikacja pozycji wyłączona.`);
+      }
+    }
+    loadCalibrationData();
+
+    // Tryb kalibracyjny (?calibrate=1) — ukryty panel do nagrywania wzorcowych
+    // pozycji. calibrationRecording (null poza nagrywaniem) jest czytane w
+    // onFrame niżej — to jedyne miejsce z dostępem do landmarków co klatkę.
+    const CALIBRATE_MODE = new URLSearchParams(location.search).get("calibrate") === "1";
+    let calibrationRecording = null;
 
     // Etykiety urządzeń (nazwy kamer) są dostępne dopiero PO udzieleniu
     // zgody na kamerę choć raz — wcześniej przeglądarka pokazuje je puste.
@@ -900,6 +1044,15 @@
         poseCanvas.height = userCameraVideo.videoHeight;
         log("Auto-korekta: ładuję MediaPipe Pose (lite)...");
         poseDetector = await createPoseDetector(userCameraVideo, (landmarks) => {
+          // Tryb kalibracyjny: zbieranie próbek działa niezależnie od stanu
+          // k-NN niżej — to właśnie te próbki tworzą jego dane treningowe.
+          if (calibrationRecording) {
+            calibrationRecording.samples.push({
+              t: Math.round(performance.now() - calibrationRecording.startedAt),
+              landmarks: landmarks.map((p) => ({ x: p.x, y: p.y, z: p.z, visibility: p.visibility ?? null })),
+            });
+          }
+
           const exercise = activeExercise;
           const rules = exercise ? RULES[exercise] : null;
           drawLandmarks(poseCanvasCtx, landmarks, {
@@ -916,12 +1069,63 @@
             poseCanvasCtx.restore();
             return;
           }
+
+          let readoutY = 16;
+
+          // k-NN + maszyna stanów: niezależny od reguł kątowych tor
+          // rozpoznawania SAMEJ pozycji (zadana_pozycja = exercise, wykonywana
+          // = lastKnnClassification.label). Gdy calibration/ jest puste,
+          // knnClassifier.isReady() jest false i CAŁY ten blok się nie
+          // wykonuje — postureStateMachine.getState() zostaje na "ENTERING"
+          // (nic nigdy nie woła update()), więc gate niżej przed pętlą reguł
+          // nigdy nie zadziała: zero zmiany zachowania względem stanu przed
+          // tą funkcją (graceful degradation, kryterium (c)).
+          if (knnClassifier.isReady()) {
+            // Throttling: klasyfikacja co KNN_CLASSIFY_EVERY_N_FRAMES klatek,
+            // nie co klatkę (kryterium (f)) — dystans do setek próbek 30x/s
+            // byłby zbędnym narzutem, a najkrótsze okno stabilności maszyny
+            // stanów to 2s, więc i tak jest >=5 odczytów w tym oknie.
+            if (knnFrameCounter++ % KNN_CLASSIFY_EVERY_N_FRAMES === 0) {
+              knnClassifyTicks++;
+              lastKnnClassification = knnClassifier.classify(landmarks);
+              const { mismatchEvent } = postureStateMachine.update(performance.now(), lastKnnClassification);
+              if (mismatchEvent) {
+                log(`Maszyna stanów: ROZJAZD — zadana "${exercise}", wykryta "${mismatchEvent.detected}".`);
+                sendPostureMismatchCue(exercise, mismatchEvent.detected);
+              }
+            }
+            const nowTs = performance.now();
+            if (nowTs - knnFreqLogAt > 5000) {
+              console.debug(`k-NN: ${knnClassifyTicks} klasyfikacji w ~5s (throttle = co ${KNN_CLASSIFY_EVERY_N_FRAMES} klatek).`);
+              knnClassifyTicks = 0;
+              knnFreqLogAt = nowTs;
+            }
+
+            const stateNow = postureStateMachine.getState();
+            poseCanvasCtx.save();
+            poseCanvasCtx.scale(-1, 1);
+            poseCanvasCtx.font = "14px monospace";
+            poseCanvasCtx.fillStyle = stateNow === "MISMATCH" ? "#ff3b30" : "#00dc78";
+            poseCanvasCtx.fillText(
+              `k-NN [${stateNow}]: ${lastKnnClassification?.label ?? "nieznana"} (${(lastKnnClassification?.confidence ?? 0).toFixed(2)})`,
+              -poseCanvas.width + 8,
+              readoutY
+            );
+            poseCanvasCtx.restore();
+            readoutY += 18;
+
+            // ROZJAZD ma priorytet nad korektami kątowymi — patrz plan,
+            // kryterium (e). Wcześniejszy return pomija też pętlę reguł niżej
+            // (a więc i sendPostureCue/sendPostureAffirmation).
+            if (stateNow === "MISMATCH") return;
+          }
+
           if (!rules) return;
           const inGracePeriod = performance.now() - lastExerciseSwitchAt < EXERCISE_SWITCH_GRACE_MS;
-          let readoutY = 16;
           let allClear = true;
-          for (const [deviation, check] of Object.entries(rules)) {
-            const result = check(landmarks);
+          for (const [deviation, rule] of Object.entries(rules)) {
+            const key = `${exercise}:${deviation}`;
+            const result = evaluateRule(rule, landmarks, valueSmoother, key);
             if (result.active) allClear = false;
             poseCanvasCtx.save();
             poseCanvasCtx.scale(-1, 1); // canvas jest w lustrzanym #camera-wrap — tekst trzeba odbić z powrotem, żeby dało się go czytać
@@ -931,7 +1135,7 @@
             poseCanvasCtx.restore();
             readoutY += 18;
             if (inGracePeriod) continue; // reguły widoczne w podglądzie, ale jeszcze nie wyzwalają korekty
-            const confirmed = postureDebouncer.check(`${exercise}:${deviation}`, result.active);
+            const confirmed = postureDebouncer.check(key, result.active);
             if (confirmed) {
               log(`Auto-korekta: wykryto "${deviation}" dla "${exercise}".`);
               sendPostureCue(exercise, deviation, { interrupt: true });
@@ -966,6 +1170,114 @@
       poseCameraToggleBtn.onclick = enableCameraAutoCorrection;
     }
     poseCameraToggleBtn.onclick = enableCameraAutoCorrection;
+
+    // ---- TRYB KALIBRACYJNY (?calibrate=1) ----
+    // Ukryty panel do nagrywania wzorcowych pozycji — dane treningowe k-NN.
+    // Zbieranie próbek per klatka dzieje się w onFrame wyżej (jedyne miejsce
+    // z dostępem do landmarków); ten blok tylko steruje UI/timingiem/zapisem.
+    const calibrationPanel = document.getElementById("calibration-panel");
+    const calibrationPoseSelect = document.getElementById("calibration-pose-select");
+    const calibrationNewPoseFields = document.getElementById("calibration-new-pose-fields");
+    const calibrationNewPoseId = document.getElementById("calibration-new-pose-id");
+    const calibrationNewPoseLabel = document.getElementById("calibration-new-pose-label");
+    const calibrationRecordBtn = document.getElementById("calibration-record-btn");
+    const calibrationStatusEl = document.getElementById("calibration-status");
+    const calibrationSummaryEl = document.getElementById("calibration-summary");
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function populateCalibrationPoseSelect() {
+      calibrationPoseSelect.innerHTML = "";
+      postureExercises.forEach((exercise) => {
+        const opt = document.createElement("option");
+        opt.value = exercise.key;
+        opt.textContent = exercise.label;
+        calibrationPoseSelect.appendChild(opt);
+      });
+      const newOpt = document.createElement("option");
+      newOpt.value = "__new__";
+      newOpt.textContent = "+ Nowa pozycja";
+      calibrationPoseSelect.appendChild(newOpt);
+    }
+    calibrationPoseSelect.onchange = () => {
+      calibrationNewPoseFields.style.display = calibrationPoseSelect.value === "__new__" ? "block" : "none";
+    };
+
+    if (CALIBRATE_MODE) {
+      calibrationPanel.style.display = "block";
+      // postureExercises jest ładowane asynchronicznie (loadPostureCues) —
+      // dropdown wypełniamy dopiero jak dane faktycznie dojdą.
+      loadPostureCues().then(populateCalibrationPoseSelect);
+    }
+
+    calibrationRecordBtn.onclick = async () => {
+      if (!poseDetector) {
+        calibrationStatusEl.textContent = "Najpierw włącz kamerę i auto-korektę (przycisk wyżej).";
+        return;
+      }
+      let poseId = calibrationPoseSelect.value;
+      let poseLabel;
+      if (poseId === "__new__") {
+        poseId = calibrationNewPoseId.value.trim();
+        poseLabel = calibrationNewPoseLabel.value.trim() || poseId;
+        if (!poseId) {
+          calibrationStatusEl.textContent = "Podaj id nowej pozycji.";
+          return;
+        }
+      } else {
+        poseLabel = postureExercises.find((e) => e.key === poseId)?.label || poseId;
+      }
+      const variant = document.querySelector('input[name="calibration-variant"]:checked').value;
+
+      calibrationRecordBtn.disabled = true;
+      calibrationSummaryEl.style.display = "none";
+      try {
+        for (let s = 5; s > 0; s--) {
+          calibrationStatusEl.textContent = `Przygotuj się... przyjmij pozycję "${poseLabel}" (${s}s).`;
+          await sleep(1000);
+        }
+        calibrationStatusEl.textContent = "Nagrywam... 10s.";
+        calibrationRecording = { startedAt: performance.now(), samples: [] };
+        await sleep(10000);
+        const recording = calibrationRecording;
+        calibrationRecording = null;
+
+        if (recording.samples.length === 0) {
+          calibrationStatusEl.textContent = "Nie zebrano żadnych klatek — spróbuj ponownie (kamera musi widzieć osobę).";
+          return;
+        }
+
+        const angleAggregates = summarizeCalibrationAngles(recording.samples);
+        calibrationSummaryEl.style.display = "block";
+        calibrationSummaryEl.textContent = JSON.stringify(angleAggregates, null, 2);
+
+        calibrationStatusEl.textContent = "Zapisuję...";
+        const durationMs = Math.round(performance.now() - recording.startedAt);
+        const res = await fetch("/api/calibration", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            poseId,
+            variant,
+            poseLabel,
+            durationMs,
+            samples: recording.samples,
+            angleAggregates,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          calibrationStatusEl.textContent = `BŁĄD zapisu: ${data.error || res.status}`;
+          return;
+        }
+        calibrationStatusEl.textContent = `Zapisano (${recording.samples.length} klatek) — ${data.file}, nagranie #${data.recordingIndex + 1} (łącznie ${data.totalRecordings}).`;
+        await loadCalibrationData(); // odśwież dane treningowe k-NN bez przeładowania strony
+      } finally {
+        calibrationRecordBtn.disabled = false;
+      }
+    };
 
     startBtn.onclick = async () => {
       startBtn.disabled = true;

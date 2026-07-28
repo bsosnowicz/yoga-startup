@@ -1,10 +1,12 @@
-// MediaPipe Pose (100% w przeglądarce, bez konta/klucza) + reguły geometryczne
-// do wykrywania "grubych błędów" postawy — PoC, nie pełna biomechanika. API
-// zweryfikowane na developers.google.com/edge/mediapipe. 4 z 6 odchyleń z
-// posture.js mają tu regułę (patrz komentarz przy RULES niżej dla reszty).
+// MediaPipe Pose (100% w przeglądarce, bez konta/klucza) — silnik oceny
+// reguł geometrycznych do wykrywania "grubych błędów" postawy, PoC, nie
+// pełna biomechanika. API zweryfikowane na developers.google.com/edge/mediapipe.
+// Same reguły (CO mierzymy, jakie progi) żyją deklaratywnie w
+// posture-rules.js — 6 z 8 odchyleń z posture.js ma tu regułę (patrz
+// komentarz przy RULES w posture-rules.js dla reszty).
 //
 // Landmarki (33 punkty, indeksy MediaPipe Pose):
-const IDX = {
+export const IDX = {
   leftEar: 7, rightEar: 8,
   leftShoulder: 11, rightShoulder: 12,
   leftElbow: 13, rightElbow: 14,
@@ -16,7 +18,7 @@ const IDX = {
   leftFootIndex: 31, rightFootIndex: 32,
 };
 
-const MIN_VISIBILITY = 0.5;
+const MIN_VISIBILITY = 0.6;
 
 function visible(point) {
   return !!point && (point.visibility === undefined || point.visibility >= MIN_VISIBILITY);
@@ -30,7 +32,7 @@ function pickVisibleSide(landmarks, leftSet, rightSet) {
 }
 
 // Kąt w punkcie b, między odcinkami b-a i b-c, w stopniach.
-export function angleAt(a, b, c) {
+function computeAngle(a, b, c) {
   const abx = a.x - b.x, aby = a.y - b.y;
   const cbx = c.x - b.x, cby = c.y - b.y;
   const magAB = Math.hypot(abx, aby);
@@ -40,104 +42,161 @@ export function angleAt(a, b, c) {
   return (Math.acos(cos) * 180) / Math.PI;
 }
 
-// Każda reguła zwraca { active, value, label } zamiast gołego boola — `value`
-// i `label` służą tylko do podglądu na żywo (kalibracja progów), `active`
-// zasila debouncer/sendPostureCue tak jak wcześniej.
-
-// child_pose / arms_not_extended — kąt w łokciu (ramię-łokieć-nadgarstek).
-// Wyprostowana ręka ~180°, wyraźnie ugięta/schowana < 140°.
-function armsNotExtended(landmarks) {
-  const label = "kąt łokcia";
-  const [shoulderI, elbowI, wristI] = pickVisibleSide(
-    landmarks,
-    [IDX.leftShoulder, IDX.leftElbow, IDX.leftWrist],
-    [IDX.rightShoulder, IDX.rightElbow, IDX.rightWrist]
-  );
-  const shoulder = landmarks[shoulderI], elbow = landmarks[elbowI], wrist = landmarks[wristI];
-  if (!visible(shoulder) || !visible(elbow) || !visible(wrist)) return { active: false, value: null, label };
-  const angle = angleAt(shoulder, elbow, wrist);
-  if (angle === null) return { active: false, value: null, label };
-  return { active: angle < 140, value: `${Math.round(angle)}°`, label };
+// Znormalizowany stosunek odległości dwóch par punktów, np. (bark.y-ucho.y) /
+// (biodro.y-bark.y). `points` to landmarki JUŻ wybrane po stronie ciała
+// (patrz evaluateRule); numerator/denominator to indeksy W TEJ tablicy, nie
+// surowe indeksy MediaPipe.
+function computeRatio(points, rule) {
+  const [nA, nB] = rule.numerator;
+  const [dA, dB] = rule.denominator;
+  const denom = points[dB].y - points[dA].y;
+  if (denom <= 0) return null;
+  return (points[nB].y - points[nA].y) / denom;
 }
 
-// downward_dog / shoulders_shrugged — (ramię.y - ucho.y) / długość tułowia
-// (biodro.y - ramię.y). Barki podciągnięte do uszu -> mały stosunek.
-function shouldersShrugged(landmarks) {
-  const label = "ucho/tułów";
-  const [earI, shoulderI, hipI] = pickVisibleSide(
-    landmarks,
-    [IDX.leftEar, IDX.leftShoulder, IDX.leftHip],
-    [IDX.rightEar, IDX.rightShoulder, IDX.rightHip]
-  );
-  const ear = landmarks[earI], shoulder = landmarks[shoulderI], hip = landmarks[hipI];
-  if (!visible(ear) || !visible(shoulder) || !visible(hip)) return { active: false, value: null, label };
-  const torsoLength = hip.y - shoulder.y;
-  if (torsoLength <= 0) return { active: false, value: null, label };
-  const ratio = (shoulder.y - ear.y) / torsoLength;
-  return { active: ratio < 0.15, value: ratio.toFixed(2), label };
+function formatValue(value, type) {
+  return type === "angle" ? `${Math.round(value)}°` : value.toFixed(2);
 }
 
-// child_pose / hips_too_high — biodro wyraźnie wyżej niż kolano (znormalizowane
-// długością tułowia ramię-biodro). Najlepiej widoczne z boku — z przodu
-// kolano i biodro mogą się nakładać na obrazie, więc to zgrubna reguła.
-function hipsTooHigh(landmarks) {
-  const label = "biodro nad kolanem";
-  const [shoulderI, hipI, kneeI] = pickVisibleSide(
-    landmarks,
-    [IDX.leftShoulder, IDX.leftHip, IDX.leftKnee],
-    [IDX.rightShoulder, IDX.rightHip, IDX.rightKnee]
-  );
-  const shoulder = landmarks[shoulderI], hip = landmarks[hipI], knee = landmarks[kneeI];
-  if (!visible(shoulder) || !visible(hip) || !visible(knee)) return { active: false, value: null, label };
-  const torsoLength = hip.y - shoulder.y;
-  if (torsoLength <= 0) return { active: false, value: null, label };
-  const ratio = (knee.y - hip.y) / torsoLength; // dodatnie = biodro wyżej niż kolano
-  return { active: ratio > 0.2, value: ratio.toFixed(2), label };
+// Wygładza N ostatnich surowych wartości (kąt/ratio) PRZED porównaniem z
+// progiem min/max — łagodzi drganie klatka-do-klatki z samego MediaPipe. To
+// INNY mechanizm niż createDeviationDebouncer niżej: tamten wygładza w czasie
+// WYNIK bool (active), ten wygładza samą liczbę, wcześniej w potoku. Brak
+// wywołania smooth() dla klucza w danej klatce (punkt niewidoczny) nie czyści
+// bufora — pojedyncza migawka niskiej pewności nie zeruje całego okna.
+// Wołający musi jawnie wyczyścić bufor przy zmianie ćwiczenia (reset()), żeby
+// nie mieszać wygładzonych wartości z innej pozycji wykonywanej wcześniej.
+export function createValueSmoother(windowSize = 5) {
+  const buffers = new Map(); // `${exercise}:${deviation}` -> number[]
+  return {
+    smooth(key, rawValue) {
+      const buf = buffers.get(key) ?? [];
+      buf.push(rawValue);
+      if (buf.length > windowSize) buf.shift();
+      buffers.set(key, buf);
+      return buf.reduce((sum, v) => sum + v, 0) / buf.length;
+    },
+    reset() {
+      buffers.clear();
+    },
+  };
 }
 
-// downward_dog / heels_lifted — pięta wyraźnie wyżej niż czubek stopy
-// (znormalizowane długością podudzia kolano-kostka). To jedyna z pierwotnie
-// "trudnych" reguł, którą jednak da się policzyć bez punktu odniesienia do
-// podłogi — MediaPipe ma osobne landmarki na piętę I czubek stopy.
-function heelsLifted(landmarks) {
-  const label = "pięta nad czubkiem stopy";
-  const [kneeI, ankleI, heelI, toeI] = pickVisibleSide(
-    landmarks,
-    [IDX.leftKnee, IDX.leftAnkle, IDX.leftHeel, IDX.leftFootIndex],
-    [IDX.rightKnee, IDX.rightAnkle, IDX.rightHeel, IDX.rightFootIndex]
-  );
-  const knee = landmarks[kneeI], ankle = landmarks[ankleI], heel = landmarks[heelI], toe = landmarks[toeI];
-  if (!visible(knee) || !visible(ankle) || !visible(heel) || !visible(toe)) return { active: false, value: null, label };
-  const shinLength = ankle.y - knee.y;
-  if (shinLength <= 0) return { active: false, value: null, label };
-  const ratio = (toe.y - heel.y) / shinLength; // dodatnie = pięta wyżej niż czubek stopy
-  return { active: ratio > 0.25, value: ratio.toFixed(2), label };
+// Silnik generyczny nad deklaratywną regułą (kształt reguły patrz
+// posture-rules.js) — te same 3 kroki, które dawniej robiła każda reguła
+// osobno "z ręki": wybierz widoczną stronę, policz surową wartość (kąt albo
+// ratio), porównaj z min/max. Zwraca { active, value, label } — ten sam
+// kontrakt co dawne funkcje reguł, więc wołający (index.html) zmienia się
+// minimalnie. `smoother`/`key` opcjonalne — bez nich ocena leci na surowej
+// wartości.
+export function evaluateRule(rule, landmarks, smoother, key) {
+  const sideIndices = pickVisibleSide(landmarks, rule.points.left, rule.points.right);
+  const points = sideIndices.map((i) => landmarks[i]);
+  if (points.some((p) => !visible(p))) return { active: false, value: null, label: rule.label };
+  const raw = rule.type === "angle"
+    ? computeAngle(points[0], points[1], points[2])
+    : computeRatio(points, rule);
+  if (raw === null) return { active: false, value: null, label: rule.label };
+  const smoothed = smoother ? smoother.smooth(key, raw) : raw;
+  const active = (rule.min !== undefined && smoothed < rule.min) ||
+                 (rule.max !== undefined && smoothed > rule.max);
+  return { active, value: formatValue(smoothed, rule.type), label: rule.label };
 }
 
-// Te same klucze co EXERCISES w posture.js — wynik podłącza się wprost pod
-// sendPostureCue(exercise, deviation) w index.html. `cat_cow` nie ma tu wpisu
-// świadomie: oba jego odchylenia (back_flat, neck_strain) opisują krzywiznę
-// kręgosłupa/karku, a MediaPipe Pose nie daje żadnego landmarku na kręgosłup
-// (tylko ramiona i biodra — 2 punkty nie pokażą krzywizny) — zostają ręczne
-// z dropdowna, zamiast zgadywać niewiarygodną regułę.
-export const RULES = {
-  child_pose: { arms_not_extended: armsNotExtended, hips_too_high: hipsTooHigh },
-  downward_dog: { shoulders_shrugged: shouldersShrugged, heels_lifted: heelsLifted },
+// Unia punktów wszystkich reguł danego ćwiczenia — do podświetlenia na
+// podglądzie kamery, żeby było widać CO dokładnie jest mierzone. Wyprowadzone
+// z RULES (posture-rules.js) zamiast ręcznie utrzymywane osobno, żeby nowa
+// reguła nie mogła po cichu rozjechać się z tym, co faktycznie się
+// podświetla.
+export function deriveHighlightIndices(rules) {
+  return Object.fromEntries(
+    Object.entries(rules).map(([exercise, deviations]) => [
+      exercise,
+      [...new Set(Object.values(deviations).flatMap((r) => [...r.points.left, ...r.points.right]))],
+    ])
+  );
+}
+
+// Przesuwa landmarki tak, by środek bioder był w (0,0), i przeskalowuje przez
+// odległość środek-bioder<->środek-barków — dopiero po tym odległości między
+// punktami są porównywalne niezależnie od odległości usera od kamery i jego
+// proporcji ciała. Współdzielona przez zapis kalibracji (knn.js, budowa
+// danych treningowych) i klasyfikację na żywo (knn.js, classify()) — jedna
+// implementacja, żeby obie strony liczyły dokładnie to samo. Pisze do
+// buforów podanych przez wołającego (outXY: Float32Array długości 66, x,y na
+// zmianę; outVisMask: Float32Array długości 33) zamiast alokować — pozwala
+// wołać to bez alokacji w gorącej pętli klasyfikacji. Zwraca false (bufory
+// niezmienione), gdy klatka jest nienormalizowalna (brak obu bioder LUB
+// brak obu barków LUB odległość między nimi ~0) — wołający traktuje to jak
+// "nieznana pozycja".
+export function normalizeLandmarksXY(landmarks, outXY, outVisMask) {
+  const lh = landmarks[IDX.leftHip], rh = landmarks[IDX.rightHip];
+  const ls = landmarks[IDX.leftShoulder], rs = landmarks[IDX.rightShoulder];
+  const lhOk = visible(lh), rhOk = visible(rh);
+  const lsOk = visible(ls), rsOk = visible(rs);
+  if (!lhOk && !rhOk) return false;
+  if (!lsOk && !rsOk) return false;
+  const hipN = (lhOk ? 1 : 0) + (rhOk ? 1 : 0);
+  const hipCX = ((lhOk ? lh.x : 0) + (rhOk ? rh.x : 0)) / hipN;
+  const hipCY = ((lhOk ? lh.y : 0) + (rhOk ? rh.y : 0)) / hipN;
+  const shN = (lsOk ? 1 : 0) + (rsOk ? 1 : 0);
+  const shCX = ((lsOk ? ls.x : 0) + (rsOk ? rs.x : 0)) / shN;
+  const shCY = ((lsOk ? ls.y : 0) + (rsOk ? rs.y : 0)) / shN;
+  const scale = Math.hypot(shCX - hipCX, shCY - hipCY);
+  if (!(scale > 1e-4)) return false;
+  for (let i = 0; i < 33; i++) {
+    const p = landmarks[i];
+    outXY[i * 2] = (p.x - hipCX) / scale;
+    outXY[i * 2 + 1] = (p.y - hipCY) / scale;
+    outVisMask[i] = visible(p) ? 1 : 0;
+  }
+  return true;
+}
+
+// Predefiniowana lista stawów do trybu kalibracyjnego (?calibrate=1) —
+// każdy jako trójka indeksów [A,B,C] dla computeAngle (kąt w B). "Biodra" i
+// "tułów-udo" to przy dostępnych landmarkach TEN SAM kąt (bark-biodro-kolano)
+// — bez dodatkowego punktu odniesienia nie da się ich rozróżnić geometrycznie,
+// stąd jedna seria left_hip/right_hip zamiast dwóch.
+const CALIBRATION_JOINTS = {
+  left_elbow: [IDX.leftShoulder, IDX.leftElbow, IDX.leftWrist],
+  right_elbow: [IDX.rightShoulder, IDX.rightElbow, IDX.rightWrist],
+  left_shoulder: [IDX.leftElbow, IDX.leftShoulder, IDX.leftHip],
+  right_shoulder: [IDX.rightElbow, IDX.rightShoulder, IDX.rightHip],
+  left_hip: [IDX.leftShoulder, IDX.leftHip, IDX.leftKnee],
+  right_hip: [IDX.rightShoulder, IDX.rightHip, IDX.rightKnee],
+  left_knee: [IDX.leftHip, IDX.leftKnee, IDX.leftAnkle],
+  right_knee: [IDX.rightHip, IDX.rightKnee, IDX.rightAnkle],
 };
 
-// Landmarki obserwowane przez reguły danego ćwiczenia — do podświetlenia na
-// podglądzie kamery, żeby było widać CO dokładnie jest mierzone.
-export const HIGHLIGHT_INDICES = {
-  child_pose: [
-    IDX.leftShoulder, IDX.rightShoulder, IDX.leftElbow, IDX.rightElbow, IDX.leftWrist, IDX.rightWrist,
-    IDX.leftHip, IDX.rightHip, IDX.leftKnee, IDX.rightKnee,
-  ],
-  downward_dog: [
-    IDX.leftEar, IDX.rightEar, IDX.leftShoulder, IDX.rightShoulder, IDX.leftHip, IDX.rightHip,
-    IDX.leftKnee, IDX.rightKnee, IDX.leftAnkle, IDX.rightAnkle, IDX.leftHeel, IDX.rightHeel,
-    IDX.leftFootIndex, IDX.rightFootIndex,
-  ],
-};
+// Podsumowanie po nagraniu kalibracyjnym (tryb ?calibrate=1): dla każdego
+// stawu z CALIBRATION_JOINTS, po klatkach o widoczności WSZYSTKICH 3 punktów
+// >= 0.6 (ta sama reguła co evaluateRule/visible wyżej) — min/max/średnia/
+// odchylenie standardowe kąta. Staw pomijany w wyniku, gdy żadna klatka nie
+// miała kompletu widocznych punktów (np. user odwrócony bokiem).
+export function summarizeCalibrationAngles(samples) {
+  const aggregates = {};
+  for (const [jointName, [a, b, c]] of Object.entries(CALIBRATION_JOINTS)) {
+    const values = [];
+    for (const sample of samples) {
+      const pa = sample.landmarks[a], pb = sample.landmarks[b], pc = sample.landmarks[c];
+      if (!visible(pa) || !visible(pb) || !visible(pc)) continue;
+      const angle = computeAngle(pa, pb, pc);
+      if (angle !== null) values.push(angle);
+    }
+    if (values.length === 0) continue;
+    const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
+    const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length;
+    aggregates[jointName] = {
+      min: Math.min(...values),
+      max: Math.max(...values),
+      mean,
+      stddev: Math.sqrt(variance),
+      sampleCount: values.length,
+    };
+  }
+  return aggregates;
+}
 
 // Minimalny szkielet do rysowania (pary indeksów) — tors/ręce/nogi/stopy/kark,
 // wystarcza do rozpoznania sylwetki, bez pełnych 35 połączeń z demo MediaPipe.

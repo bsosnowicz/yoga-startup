@@ -10,7 +10,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { buildCoachPrompt, extractionPrompt, parseExtraction } = require("./memory");
-const { buildPostureCue, buildPostureAffirmation, listExerciseCues } = require("./posture");
+const { buildPostureCue, buildPostureAffirmation, listExerciseCues, buildPostureMismatchCue } = require("./posture");
+const { appendCalibrationRecording, loadAllCalibrations } = require("./calibration");
 
 // Minimalna obsługa .env bez dokładania zależności do tego małego testowego
 // serwera. Zmienne już ustawione w środowisku mają pierwszeństwo.
@@ -347,6 +348,36 @@ async function generateGroqAffirmation(exerciseLabel) {
   const completion = await response.json();
   const text = completion?.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error("Groq nie zwrócił tekstu pochwały.");
+  return text;
+}
+
+// Komunikat "rozjazd pozycji" — k-NN (patrz public/knn.js) wykrył, że user
+// stabilnie robi INNĄ nazwaną pozycję niż tę zadaną przez trenera (patrz
+// public/posture-state-machine.js, stan MISMATCH). Dwa warianty promptu:
+// zwykły (każe wrócić, podpowiada jak) i "odpoczynkowy" (gdy wykryta pozycja
+// ma w posture.js flagę odpoczynkowa:true, np. child_pose) — wtedy NIE
+// komenderujemy powrotem, tylko pytamy czy wszystko w porządku.
+async function generateGroqMismatchCue({ targetLabel, detectedLabel, entryScript, restful }) {
+  if (!process.env.GROQ_API_KEY) throw new Error("Brak GROQ_API_KEY.");
+  const instruction = restful
+    ? `Użytkownik zamiast zadanej pozycji "${targetLabel}" jest teraz w pozycji odpoczynkowej "${detectedLabel}". NIE każ mu wracać na siłę — zapytaj krótko i ciepło, czy wszystko w porządku, i że może wrócić do "${targetLabel}", gdy będzie gotowy.`
+    : `Użytkownik zamiast zadanej pozycji "${targetLabel}" wykonuje teraz "${detectedLabel}". Powiedz, jaką pozycję widzisz, jaką zadałeś, i jak krótko przejść do właściwej (podpowiedź: "${entryScript}"). Wzorzec: "Widzę, że jesteś w X, a prosiłem o Y... żeby przejść: ...".`;
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.4,
+      messages: [
+        { role: "system", content: POSTURE_COACH_STYLE_GUIDE },
+        { role: "user", content: `${instruction}\n\nPodaj JEDNO-DWA krótkie zdania po polsku. Tylko sama wypowiedź, bez cudzysłowów i bez wyjaśnień.` },
+      ],
+    }),
+  });
+  if (!response.ok) throw new Error(`Groq ${response.status}: ${await response.text()}`);
+  const completion = await response.json();
+  const text = completion?.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("Groq nie zwrócił tekstu komunikatu rozjazdu.");
   return text;
 }
 
@@ -747,7 +778,8 @@ const PROVIDERS = {
       if (typeof WebSocket === "undefined") {
         throw new Error("Ten proces Node nie ma natywnego WebSocket — uruchom server.js pod Node 22+.");
       }
-      const avatarId = process.env.LIVEAVATAR_AVATAR_ID || "55eec60c-d665-4972-a529-bbdcaf665ab8";
+      const isSandbox = process.env.LIVEAVATAR_SANDBOX === "true";
+      const avatarId = process.env.LIVEAVATAR_AVATAR_ID || (isSandbox ? SANDBOX_AVATAR_ID : "55eec60c-d665-4972-a529-bbdcaf665ab8");
 
       // System prompt trenerki (TRAINER_SYSTEM_PROMPT, ta sama treść co dla
       // Anam — scenariusze czasu/kondycji/kontuzji) + ograniczona pamięć z
@@ -1377,6 +1409,53 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Serwuje wszystkie nagrane kalibracje (calibration/*.json) — klient ładuje
+  // to raz przy starcie do zbudowania danych treningowych k-NN. Pusty/brak
+  // katalogu -> [] (nigdy błąd), żeby front-end mógł się cicho wyłączyć
+  // (graceful degradation, patrz public/knn.js).
+  if (req.method === "GET" && req.url === "/api/calibration") {
+    try {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ calibrations: loadAllCalibrations() }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Dopisuje jedno nagranie kalibracyjne do calibration/<poseId>.<variant>.json
+  // (append, nie nadpisanie — patrz calibration.js). samples to surowe
+  // landmarki zebrane w przeglądarce podczas 10s nagrywania (tryb ?calibrate=1).
+  if (req.method === "POST" && req.url === "/api/calibration") {
+    try {
+      const body = await readJsonBody(req);
+      if (
+        !body.poseId ||
+        !["pelna", "zlagodzona"].includes(body.variant) ||
+        !Array.isArray(body.samples) ||
+        body.samples.length === 0
+      ) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Wymagane: poseId, variant (pelna|zlagodzona), niepusty samples[]." }));
+        return;
+      }
+      const result = appendCalibrationRecording(body.poseId, body.variant, body.poseLabel, {
+        recordedAt: body.recordedAt || new Date().toISOString(),
+        durationMs: body.durationMs,
+        samples: body.samples,
+        angleAggregates: body.angleAggregates || {},
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, poseId: body.poseId, variant: body.variant, ...result }));
+    } catch (e) {
+      console.error("Błąd zapisu kalibracji:", e.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   // Zwraca tekst korekty dla danego ćwiczenia/odchylenia. exercise/deviation
   // przychodzą z pose-detector.js (reguły geometryczne + debouncer w
   // index.html), które ćwiczenie jest aktualne wykrywa detectActiveExercise()
@@ -1511,6 +1590,42 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Komunikat "rozjazd pozycji" — public/posture-state-machine.js (stan
+  // MISMATCH) wywołuje to, gdy k-NN stabilnie widzi INNĄ nazwaną pozycję niż
+  // zadana. Wzorzec identyczny do /api/posture-correction: fallback-first,
+  // interrupt:true (najwyższy priorytet — patrz speakLiteCue niżej).
+  if (req.method === "POST" && req.url === "/api/posture-mismatch") {
+    try {
+      const body = await readJsonBody(req);
+      const cue = buildPostureMismatchCue(body.target, body.detected);
+      if (!cue) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Nieznana kombinacja target/detected: ${body.target}/${body.detected}` }));
+        return;
+      }
+      let source = "fallback";
+      try {
+        cue.text = await generateGroqMismatchCue(cue);
+        source = "groq";
+      } catch (groqError) {
+        console.warn("Posture Mismatch: Groq nie odpowiedział, używam fallbacku:", groqError.message);
+      }
+      const liteSession = liteSessions.get(body.sessionId);
+      if (liteSession) {
+        speakLiteCue(liteSession, cue.text, { interrupt: true }).catch((e) =>
+          console.error("LiveAvatar Lite: błąd wygłoszenia komunikatu rozjazdu:", e.message)
+        );
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...cue, source }));
+    } catch (e) {
+      console.error("Błąd Posture Mismatch:", e.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   // Barge-in: przeglądarka wywołuje to, gdy użytkownik zaczyna mówić W
   // TRAKCIE gdy awatar jeszcze gada. Przerywa bieżącą turę (Groq przez
   // AbortController, LiveAvatar przez agent.interrupt) i od razu zwalnia
@@ -1591,11 +1706,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Statyczne pliki z /public
+  // Statyczne pliki z /public. Odcinamy query string (np. ?calibrate=1) przez
+  // pathname — surowe req.url porównane z "/" nie łapało "/?calibrate=1",
+  // co dawało 404 zamiast index.html z parametrem.
+  const { pathname } = new URL(req.url, "http://localhost");
   const filePath = path.join(
     __dirname,
     "public",
-    req.url === "/" ? "index.html" : req.url
+    pathname === "/" ? "index.html" : pathname
   );
   fs.readFile(filePath, (err, content) => {
     if (err) {
