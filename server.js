@@ -10,6 +10,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { buildCoachPrompt, extractionPrompt, parseExtraction } = require("./memory");
+const { PROFILE_KEYS, PREFERENCE_KEYS, SESSION_KEYS } = require("./memory-schema");
 const { buildPostureCue, buildPostureAffirmation, listExerciseCues, buildPostureMismatchCue } = require("./posture");
 const { appendCalibrationRecording, loadAllCalibrations } = require("./calibration");
 
@@ -127,26 +128,74 @@ async function supabaseRequest(resource, options = {}) {
   return response;
 }
 
-async function loadMemoryContext(userId) {
-  if (!process.env.SUPABASE_URL || !supabaseServiceKey()) return { profile: [], preferences: [], unfinishedSession: [] };
+// Aktywne kontuzje jako STRUKTURA, nie zdanie: [{body_part, severity, note}],
+// gdzie body_part i severity to enumy z memory-schema.js. To jest kontrakt dla
+// przyszłego twardego filtra asan — filtr dopasowuje po identyfikatorze partii
+// ciała, nie po tekście (dawne "problem with right shoulder" nie dało się
+// dopasować do żadnego tagu asany).
+async function getActiveInjuries(userId) {
+  if (!process.env.SUPABASE_URL || !supabaseServiceKey()) return [];
   try {
-    const [profileResponse, preferenceResponse, sessionResponse] = await Promise.all([
-      supabaseRequest(`user_memory?user_id=eq.${encodeURIComponent(userId)}&category=eq.profile&select=key,value,confidence&order=updated_at.desc&limit=7`),
-      supabaseRequest(`user_memory?user_id=eq.${encodeURIComponent(userId)}&category=eq.preference&select=key,value,confidence&order=updated_at.desc&limit=3`),
-      supabaseRequest(`session_memory?user_id=eq.${encodeURIComponent(userId)}&is_unfinished=eq.true&select=source_session_id,key,value,confidence&order=created_at.desc&limit=20`),
+    const response = await supabaseRequest(
+      `user_injuries?user_id=eq.${encodeURIComponent(userId)}&status=eq.active&select=body_part,severity,note&order=reported_at.desc`
+    );
+    return await response.json();
+  } catch (error) {
+    // Tabela może jeszcze nie istnieć. Brak kontuzji nie może zablokować sesji.
+    console.warn("Memory Cleanup: nie udało się odczytać kontuzji:", error.message);
+    return [];
+  }
+}
+
+// is_unfinished nigdy nie wracało na false, więc raz przerwana sesja doklejała
+// się do KAŻDEGO kolejnego promptu w nieskończoność (w bazie wiszą takie
+// rekordy z 20-21 lipca). Kasujemy flagę zaraz po odczycie: kontekst został
+// właśnie wstrzyknięty do promptu startującej sesji, czyli jest obsłużony.
+// Rekordy zostają w bazie — gaśnie tylko flaga "do wznowienia".
+async function markUnfinishedSessionsHandled(userId) {
+  try {
+    await supabaseRequest(`session_memory?user_id=eq.${encodeURIComponent(userId)}&is_unfinished=eq.true`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
+      body: JSON.stringify({ is_unfinished: false }),
+    });
+  } catch (error) {
+    console.warn("Memory Cleanup: nie udało się wyczyścić flagi niedokończonej sesji:", error.message);
+  }
+}
+
+async function loadMemoryContext(userId) {
+  const empty = { profile: [], preferences: [], unfinishedSession: [], injuries: [] };
+  if (!process.env.SUPABASE_URL || !supabaseServiceKey()) return empty;
+  try {
+    // Filtr po słowniku jest też po stronie ODCZYTU, nie tylko zapisu: w bazie
+    // siedzą jeszcze stare rekordy z kluczami spoza enuma (np.
+    // physical_limitation: "problem with right shoulder"). Bez tego filtra
+    // wciekłyby do polskiego promptu mimo domkniętego zapisu — a kontuzje mają
+    // teraz swoją tabelę, nie klucz w user_memory.
+    const [profileResponse, preferenceResponse, sessionResponse, injuries] = await Promise.all([
+      supabaseRequest(`user_memory?user_id=eq.${encodeURIComponent(userId)}&category=eq.profile&key=in.(${PROFILE_KEYS.join(",")})&select=key,value,confidence&order=updated_at.desc&limit=7`),
+      supabaseRequest(`user_memory?user_id=eq.${encodeURIComponent(userId)}&category=eq.preference&key=in.(${PREFERENCE_KEYS.join(",")})&select=key,value,confidence&order=updated_at.desc&limit=3`),
+      supabaseRequest(`session_memory?user_id=eq.${encodeURIComponent(userId)}&is_unfinished=eq.true&key=in.(${SESSION_KEYS.join(",")})&select=source_session_id,key,value,confidence&order=created_at.desc&limit=20`),
+      getActiveInjuries(userId),
     ]);
     const unfinishedCandidates = await sessionResponse.json();
     const latestUnfinishedId = unfinishedCandidates[0]?.source_session_id;
+    // Tylko najnowsza niedokończona sesja; jej kilka rekordów opisuje stan.
+    const unfinishedSession = latestUnfinishedId
+      ? unfinishedCandidates.filter((item) => item.source_session_id === latestUnfinishedId)
+      : [];
+    if (unfinishedCandidates.length) await markUnfinishedSessionsHandled(userId);
     return {
       profile: await profileResponse.json(),
       preferences: await preferenceResponse.json(),
-      // Tylko najnowsza niedokończona sesja; jej kilka rekordów opisuje stan.
-      unfinishedSession: latestUnfinishedId ? unfinishedCandidates.filter((item) => item.source_session_id === latestUnfinishedId) : [],
+      unfinishedSession,
+      injuries,
     };
   } catch (error) {
     // Migracja może nie być jeszcze uruchomiona. Nie blokujemy LiveAvatar.
     console.warn("Memory Cleanup: nie udało się odczytać pamięci:", error.message);
-    return { profile: [], preferences: [], unfinishedSession: [] };
+    return empty;
   }
 }
 
@@ -160,16 +209,20 @@ async function extractAndPersistMemory(record) {
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         temperature: 0,
-        messages: [{ role: "system", content: "You extract only explicit user facts. Return JSON only." }, { role: "user", content: extractionPrompt(transcript) }],
+        messages: [{ role: "system", content: "Wyciągasz wyłącznie jawnie powiedziane fakty o użytkowniku. Odpowiadasz samym JSON-em." }, { role: "user", content: extractionPrompt(transcript) }],
       }),
     });
     if (!groqResponse.ok) throw new Error(`Groq ${groqResponse.status}: ${await groqResponse.text()}`);
     const completion = await groqResponse.json();
-    const items = parseExtraction(completion?.choices?.[0]?.message?.content, record.session_id, transcript);
+    const { facts, injuries, rejected } = parseExtraction(completion?.choices?.[0]?.message?.content, record.session_id, transcript);
+    // Klucz spoza słownika nie trafia do bazy — ale musi zostawić ślad, bo to
+    // sygnał, że prompt ekstrakcji rozjechał się ze słownikiem (memory-schema.js).
+    if (rejected.length) console.warn(`Memory Cleanup: odrzucono ${rejected.length} wpis(ów) spoza słownika: ${rejected.join("; ")}`);
     const userId = record.user_id || memoryUserId();
-    const profileItems = items.filter((item) => item.category === "profile" || item.category === "preference")
-      .map((item) => ({ ...item, user_id: userId, updated_at: new Date().toISOString() }));
-    const sessionItems = items.filter((item) => item.category === "session");
+    const now = new Date().toISOString();
+    const profileItems = facts.filter((item) => item.category === "profile" || item.category === "preference")
+      .map((item) => ({ ...item, user_id: userId, updated_at: now }));
+    const sessionItems = facts.filter((item) => item.category === "session");
     if (profileItems.length) await supabaseRequest("user_memory?on_conflict=user_id,category,key", {
       method: "POST", headers: { "Content-Type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(profileItems),
     });
@@ -182,7 +235,26 @@ async function extractAndPersistMemory(record) {
         body: JSON.stringify(sessionItems.map((item) => ({ ...item, user_id: userId, is_unfinished: isUnfinished }))),
       });
     }
-    console.log(`Memory Cleanup: zapisano ${profileItems.length} faktów i ${sessionItems.length} faktów sesji.`);
+    // Upsert po UNIQUE(user_id, body_part): kolejne zgłoszenie TEJ SAMEJ partii
+    // aktualizuje jeden rekord zamiast dokładać kolejny. Wcześniej każda sesja
+    // dokładała osobny reported_discomfort i do promptu leciały naraz cztery
+    // sprzeczne zdania o tym samym barku.
+    if (injuries.length) {
+      await supabaseRequest("user_injuries?on_conflict=user_id,body_part", {
+        method: "POST", headers: { "Content-Type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(injuries.map((item) => ({
+          user_id: userId,
+          body_part: item.body_part,
+          status: item.status,
+          severity: item.severity,
+          note: item.note,
+          source_session_id: item.source_session_id,
+          reported_at: now,
+          resolved_at: item.status === "resolved" ? now : null,
+        }))),
+      });
+    }
+    console.log(`Memory Cleanup: zapisano ${profileItems.length} faktów, ${sessionItems.length} faktów sesji i ${injuries.length} zgłoszeń kontuzji.`);
   } catch (error) {
     // Sesja została już bezpiecznie zapisana; błąd ekstrakcji nie może jej cofnąć.
     console.error("Memory Cleanup: ekstrakcja nieudana:", error.message);
