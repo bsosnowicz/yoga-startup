@@ -60,6 +60,23 @@ const BODY_PARTS = [
 const INJURY_STATUSES = ["active", "resolved"];
 const INJURY_SEVERITIES = ["low", "medium", "high"];
 
+// Poziom sprawności użytkownika — pierwszy fakt, którego WARTOŚĆ jest enumem
+// maszynowym, a nie zdaniem po polsku (patrz nagłówek pliku: dotąd granica
+// biegła po kluczach, wartości były wyłącznie tekstem do promptu).
+// Powód: `poziom_min` asany (asany/*.json) operuje dokładnie na tej skali, więc
+// planner i filtr kontuzji muszą móc porównać jedno z drugim. Dopóki pamięć
+// zapisywała "początkujący", a asana "niska", nie było czego z czym zestawić.
+// Skala jest ASCII (bez ogonków), tak jak wszystkie identyfikatory tutaj —
+// polskie brzmienie żyje w FACT_VALUE_META_PL niżej.
+const FITNESS_LEVELS = ["niska", "srednia", "wysoka"];
+
+// Rejestr kluczy o zamkniętym zbiorze wartości. Generyczny celowo: dopisanie
+// tu `flexibility_level` (albo `preferred_intensity`) to jedna linia, bez
+// dotykania walidacji w memory.js.
+const FACT_VALUE_ENUMS = {
+  fitness_level: FITNESS_LEVELS,
+};
+
 // Kategoria "injury" NIE ma kluczy — jest obsługiwana strukturalnie
 // (body_part/status/severity/note), osobnym torem niż fakty klucz-wartość.
 const FACT_KEYS_BY_CATEGORY = {
@@ -108,6 +125,23 @@ const SEVERITY_LABELS_PL = {
   high: "silna",
 };
 
+// Dwa różne odbiorcy tej samej wartości enuma, stąd dwa pola:
+//   etykieta — polskie brzmienie z ogonkami, wstrzykiwane w prompt TRENERA
+//     (buildMemoryContext), żeby nie było widać ASCII-owego "srednia";
+//   opis — znaczenie dla modelu EKSTRAKCJI, żeby potrafił zmapować swobodną
+//     wypowiedź ("jestem początkujący") na właściwą wartość enuma. Mapowanie
+//     synonimów należy do modelu, nie do regexpa w kodzie — dokładnie z tego
+//     samego powodu, co wykrywanie bólu (patrz komentarz w parseExtraction).
+const FITNESS_LEVEL_META_PL = {
+  niska: { etykieta: "niska", opis: "początkujący, mało ruchu na co dzień, dawno nie ćwiczył" },
+  srednia: { etykieta: "średnia", opis: "ćwiczy od czasu do czasu, przeciętna sprawność" },
+  wysoka: { etykieta: "wysoka", opis: "ćwiczy regularnie, dobra sprawność" },
+};
+
+const FACT_VALUE_META_PL = {
+  fitness_level: FITNESS_LEVEL_META_PL,
+};
+
 // Klucze też są identyfikatorami ASCII, a trafiają do promptu dosłownie —
 // więc mają swoje polskie etykiety, dokładnie jak partie ciała. W bazie
 // zostaje enum (po nim dopasowuje kod), w prompcie widać polski.
@@ -137,6 +171,20 @@ function isAllowedKey(category, key) {
 
 function isBodyPart(value) {
   return BODY_PART_SET.has(value);
+}
+
+// Zwraca listę dozwolonych wartości dla klucza albo null, gdy wartość tego
+// klucza jest dowolnym tekstem (domyślny przypadek — patrz FACT_VALUE_ENUMS).
+function factValueEnum(key) {
+  return FACT_VALUE_ENUMS[key] || null;
+}
+
+function isFitnessLevel(value) {
+  return FITNESS_LEVELS.includes(value);
+}
+
+function factValueLabel(key, value) {
+  return FACT_VALUE_META_PL[key]?.[value]?.etykieta || value;
 }
 
 function isInjuryStatus(value) {
@@ -172,6 +220,17 @@ function factKeysForPrompt() {
     .join("\n  ");
 }
 
+// Klucze o zamkniętym zbiorze wartości — model dostaje enum do zwrócenia i
+// polski opis znaczenia, tak samo jak przy partiach ciała wyżej.
+function factValuesForPrompt() {
+  return Object.entries(FACT_VALUE_ENUMS)
+    .map(([key, values]) => {
+      const opisy = values.map((value) => `"${value}" (${FACT_VALUE_META_PL[key]?.[value]?.opis || value})`);
+      return `${key}: ${opisy.join(", ")}`;
+    })
+    .join("\n  ");
+}
+
 module.exports = {
   PROFILE_KEYS,
   PREFERENCE_KEYS,
@@ -179,6 +238,8 @@ module.exports = {
   BODY_PARTS,
   INJURY_STATUSES,
   INJURY_SEVERITIES,
+  FITNESS_LEVELS,
+  FACT_VALUE_ENUMS,
   FACT_KEYS_BY_CATEGORY,
   BODY_PART_LABELS_PL,
   SEVERITY_LABELS_PL,
@@ -189,8 +250,12 @@ module.exports = {
   isBodyPart,
   isInjuryStatus,
   isInjurySeverity,
+  isFitnessLevel,
+  factValueEnum,
+  factValueLabel,
   bodyPartLabel,
   severityLabel,
   bodyPartsForPrompt,
   factKeysForPrompt,
+  factValuesForPrompt,
 };

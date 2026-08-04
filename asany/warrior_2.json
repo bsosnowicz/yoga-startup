@@ -1,0 +1,50 @@
+{
+  "id": "warrior_2",
+  "nazwa": "Wojownik II",
+  "sanskryt": "Virabhadrasana II",
+  "typ": "wzmacniajaca",
+  "poziom_min": "srednia",
+  "odpoczynkowa": false,
+  "slowa_kluczowe": ["wojownik ii", "wojownika ii", "wojowniku ii", "wojownik 2", "wojownika 2", "virabhadrasana"],
+
+  "obciaza": ["knee_left", "knee_right", "hip_left", "hip_right", "shoulder_left", "shoulder_right"],
+  "przeciwwskazania_twarde": ["knee_left", "knee_right"],
+  "przeciwwskazania_miekkie": ["hip_left", "hip_right", "shoulder_left", "shoulder_right"],
+
+  "czasy_trzymania_oddechy": { "niska": 3, "srednia": 5, "wysoka": 6 },
+
+  "skrypty": {
+    "wejscie": "Stań szeroko, przednie kolano ugnij do kąta prostego, tylną nogę wyprostuj, ręce rozłóż na wysokości barków.",
+    "trzymanie": "Patrz nad przednią dłonią... oddychaj spokojnie i trzymaj tułów pionowo, nie pochylaj się do przodu.",
+    "wyjscie": "Na wdechu wyprostuj przednią nogę, opuść ręce... zsuń stopy i stań spokojnie.",
+    "modyfikacja_lagodna": "Zwęź rozkrok i uginaj przednie kolano tylko do połowy... ręce możesz oprzeć na biodrach."
+  },
+
+  "detekcja": {
+    "aktywna": true,
+    "reguly": [
+      {
+        "id": "front_knee_not_bent",
+        "etykieta": "Przednie kolano za mało ugięte",
+        "korekta": "Ugnij mocniej przednie kolano, aż udo zbliży się do równoległego z podłogą.",
+        "type": "angle",
+        "label": "kąt kolana",
+        "points": { "left": [23, 25, 27], "right": [24, 26, 28] },
+        "min": 80,
+        "max": 120
+      },
+      {
+        "id": "arms_not_level",
+        "etykieta": "Ręce nie na wysokości barków",
+        "korekta": "Wyrównaj ręce do linii barków... wyciągnij je mocno w przeciwne strony.",
+        "type": "ratio",
+        "label": "nadgarstek vs linia barków",
+        "points": { "left": [11, 23, 15], "right": [12, 24, 16] },
+        "numerator": [0, 2],
+        "denominator": [0, 1],
+        "min": -0.2,
+        "max": 0.2
+      }
+    ]
+  }
+}

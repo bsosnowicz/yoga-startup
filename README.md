@@ -57,6 +57,90 @@ Sprawdź zachowanie bez uruchamiania rozmowy:
 node test-memory.js
 ```
 
+## Rejestr asan — `asany/*.json`
+
+Definicje pozycji (treść, warstwa metodyczna, progi detekcji) są **danymi, nie
+kodem**: jeden plik `asany/<id>.json` na pozycję, wczytywany przy starcie przez
+[asany.js](asany.js). Powód jest organizacyjny: RFP rozdziela role — warstwę
+metodyczną (dobór asan, sekwencjonowanie, wykluczenia zdrowotne) dostarcza
+Zamawiający, implementację Wykonawca. Wcześniej lista asan siedziała w prozie
+`TRAINER_SYSTEM_PROMPT`, metadane w `posture.js`, a progi w
+`public/posture-rules.js` — metodyk nie miał czego dostarczyć. JSON, nie YAML,
+bo projekt świadomie nie ma żadnej zależności npm.
+
+Kto z tego czyta:
+- `TRAINER_SYSTEM_PROMPT` (`server.js`) — sekcja `[ASANY]` jest **generowana**
+  przez `asanyDoPromptu()`, nie wpisana ręcznie (to naprawiło przy okazji
+  usterkę: `warrior_2` miał komplet reguł i słów kluczowych, ale trener nigdy
+  go nie zadawał, bo prompt o nim nie wiedział);
+- `posture.js` — teksty korekt/pochwał/rozjazdu pozycji (`buildPostureCue` itd.);
+- `GET /api/posture-cues` — słowa kluczowe do auto-detekcji ćwiczenia z rozmowy;
+- `GET /api/asany/detekcja` — same reguły geometryczne dla przeglądarki
+  (front-end nie czyta dysku), konsumowane przez `public/posture-rules.js`.
+
+Dodanie pozycji = dodanie pliku + restart serwera. Żadnej zmiany w kodzie.
+
+### Schemat pliku
+
+| pole | typ | wym. | znaczenie |
+| --- | --- | --- | --- |
+| `id` | string | tak | identyfikator ASCII; **musi** równać się nazwie pliku (po tym samym id nazywane są nagrania kalibracyjne k-NN w `calibration/`) |
+| `nazwa` | string | tak | nazwa po polsku — tą nazwą mówi trener i po niej user rozpoznaje pozycję |
+| `sanskryt` | string | nie | nazwa sanskrycka, trafia do promptu w nawiasie |
+| `typ` | enum | tak | `rozciaganie`, `wzmacniajaca`, `rownowaga`, `relaksacyjna`, `oddechowa` |
+| `poziom_min` | enum | tak | minimalna kondycja użytkownika: `niska`, `srednia`, `wysoka` |
+| `odpoczynkowa` | bool | tak | pozycja regeneracyjna — przy rozjeździe pozycji trener pyta o samopoczucie zamiast kazać wracać |
+| `slowa_kluczowe` | string[] | tak | frazy (małymi literami) do wykrycia pozycji z transkrypcji rozmowy; puste = pozycja nigdy nie zostanie wykryta |
+| `obciaza` | BODY_PARTS[] | tak | partie ciała, które pozycja realnie obciąża — może być `[]` |
+| `przeciwwskazania_twarde` | BODY_PARTS[] | tak | aktywna kontuzja tej partii = **nie proponować** pozycji |
+| `przeciwwskazania_miekkie` | BODY_PARTS[] | tak | kontuzja tej partii = proponować tylko wariant `modyfikacja_lagodna` / z ostrzeżeniem |
+| `czasy_trzymania_oddechy` | obiekt | tak | liczba oddechów w trzymaniu per poziom: `{ "niska": n, "srednia": n, "wysoka": n }`, dodatnie liczby całkowite |
+| `skrypty.wejscie` | string | tak | jak wejść w pozycję (używa tego też komunikat o rozjeździe pozycji) |
+| `skrypty.trzymanie` / `.wyjscie` / `.modyfikacja_lagodna` | string | nie | co mówić w trzymaniu / jak wyjść / wariant łagodniejszy |
+| `detekcja` | obiekt | nie | brak sekcji = pozycja działa w rozmowie, ale bez korekty z kamery |
+| `detekcja.aktywna` | bool | tak\* | wyłącznik reguł bez kasowania ich z pliku |
+| `detekcja.reguly[]` | tablica | tak\* | reguły geometryczne, patrz niżej |
+
+`BODY_PARTS[]` to **ten sam enum**, którym pamięć taguje kontuzje użytkownika
+(`memory-schema.js`) — `shoulder_left`, `wrist_right`, `lower_back`, … Pozycja
+obciążająca symetrycznie wymienia obie strony. Dzięki wspólnemu enumowi przyszły
+filtr kontuzji porówna identyfikator z identyfikatorem, bez tłumaczenia jednej
+listy na drugą. Wartość spoza enuma = plik odrzucony z komunikatem w logu.
+
+Pola reguły w `detekcja.reguly[]` — **`id`, `etykieta`, `korekta` po polsku
+(treść dla metodyka), reszta po angielsku 1:1** (to kontrakt z `evaluateRule()`
+w `public/pose-detector.js`, który dostaje regułę bez tłumaczenia):
+
+| pole | typ | wym. | znaczenie |
+| --- | --- | --- | --- |
+| `id` | string | tak | identyfikator odchylenia, np. `heels_lifted`; unikalny w obrębie pozycji |
+| `etykieta` | string | tak | nazwa błędu po polsku — karmi Groqa przy generowaniu korekty |
+| `korekta` | string | nie | **fallback** wypowiedzi, gdy Groq zawiedzie; bez niego składane jest zdanie z `etykieta` |
+| `type` | `"angle"` \| `"ratio"` | tak | kąt w stopniach albo znormalizowany stosunek |
+| `label` | string | tak | podpis odczytu na podglądzie kamery, np. `kąt łokcia` |
+| `points.left` / `.right` | int[] | tak | indeksy landmarków MediaPipe (0–32), obie strony tej samej długości; `angle` wymaga dokładnie 3 punktów `[A, B, C]` (kąt w `B`) |
+| `numerator` / `denominator` | [int, int] | ratio | indeksy **w tablicy `points`**, nie surowe landmarki |
+| `min` / `max` | number | ≥1 z nich | zdrowy zakres; reguła jest aktywna (błąd), gdy wartość wyjdzie poza `[min, max]` |
+
+Walidacja przy starcie zgłasza **wszystkie** błędy pliku naraz i pomija tylko ten
+plik — literówka metodyka nie kładzie serwera (ten sam kontrakt co
+`loadAllCalibrations` w `calibration.js`):
+
+```
+Asany: pomijam zla_partia.json — 3 błąd(ów) walidacji:
+  - pole "obciaza": "shoulder" nie jest partią ciała z enuma BODY_PARTS (memory-schema.js)
+  - pole "przeciwwskazania_twarde": "prawy nadgarstek" nie jest partią ciała z enuma BODY_PARTS (memory-schema.js)
+  - detekcja.reguly[0]: indeks landmarku 99 jest spoza zakresu 0-32
+Asany: wczytano 3 z 5 plików (child_pose, downward_dog, warrior_2).
+```
+
+**Wartości metodyczne w trzech obecnych plikach są robocze** (wypełnione przez
+Wykonawcę, do zatwierdzenia przez metodyka): `typ`, `poziom_min`, `obciaza`,
+oba rodzaje przeciwwskazań, `czasy_trzymania_oddechy` oraz skrypty
+`trzymanie`/`wyjscie`/`modyfikacja_lagodna`. Przeniesione 1:1 ze starego kodu
+(bez zmiany wartości) są: `nazwa`, `slowa_kluczowe`, `odpoczynkowa`,
+`skrypty.wejscie` i cała sekcja `detekcja`.
+
 ## Sprint 2 — korekta postawy (live)
 
 "Czytaj ruch na żywo → wygeneruj korektę (albo pochwałę) dla bieżącego
@@ -66,10 +150,12 @@ pokryciem regułami geometrycznymi). To namiastka biomechaniki ("kilka grubych
 błędów"), nie pełny system.
 
 Co działa już teraz:
-- [posture.js](posture.js) — rejestr 3 ćwiczeń/odchyleń (`buildPostureCue`,
-  `buildPostureAffirmation`, `listExerciseCues`). `text` w rejestrze to
-  **fallback**, nie główne źródło wypowiedzi (patrz niżej). `keywords` per
-  ćwiczenie służą do wykrycia z transkrypcji rozmowy, które ćwiczenie trwa.
+- [posture.js](posture.js) — buduje teksty (`buildPostureCue`,
+  `buildPostureAffirmation`, `listExerciseCues`, `buildPostureMismatchCue`) nad
+  rejestrem asan; **sam nie zna żadnej pozycji** — dane bierze z `asany/*.json`
+  (patrz sekcja "Rejestr asan" wyżej). `korekta` w regule to **fallback**, nie
+  główne źródło wypowiedzi (patrz niżej). `slowa_kluczowe` per pozycja służą do
+  wykrycia z transkrypcji rozmowy, które ćwiczenie trwa.
 - `GET /api/posture-cues` — zwraca rejestr (z keywordami) do klienta.
 - `POST /api/posture-correction` `{ exercise, deviation }` i
   `POST /api/posture-affirmation` `{ exercise }` → `{ text, source }` — oba
@@ -87,9 +173,12 @@ Co działa już teraz:
   PRZED porównaniem z progiem — osobny mechanizm od czasowego debounce'a
   (`createDeviationDebouncer`) niżej, który wygładza w czasie już gotowy wynik
   bool, nie samą liczbę.
-- [public/posture-rules.js](public/posture-rules.js) — deklaratywne dane 6
-  reguł geometrycznych (typ `angle` albo `ratio`, indeksy landmarków, progi
-  `min`/`max`), oddzielone od silnika w `pose-detector.js`: `child_pose/arms_not_extended`
+- [public/posture-rules.js](public/posture-rules.js) — klient
+  `GET /api/asany/detekcja` i cache reguł na czas życia karty (`loadPostureRules`,
+  `rulesFor`, `highlightIndicesFor`). Same dane 6 reguł geometrycznych (typ
+  `angle` albo `ratio`, indeksy landmarków, progi `min`/`max`) mieszkają w sekcji
+  `detekcja` plików `asany/*.json`, oddzielone od silnika w `pose-detector.js`:
+  `child_pose/arms_not_extended`
   (kąt w łokciu), `child_pose/hips_too_high` (biodro vs kolano),
   `downward_dog/shoulders_shrugged` (ucho vs ramię), `downward_dog/heels_lifted`
   (pięta vs czubek stopy), `warrior_2/front_knee_not_bent` (kąt przedniego
@@ -99,7 +188,7 @@ Co działa już teraz:
   uproszczenie tymczasowe.
 - **Ćwiczenie wykrywane jest automatycznie z rozmowy**, nie ręcznie: w
   [public/index.html](public/index.html) `detectActiveExercise()` dopasowuje
-  `keywords` z `posture.js` do transkrypcji zarówno usera, jak i avatara
+  `slowa_kluczowe` z `asany/*.json` do transkrypcji zarówno usera, jak i avatara
   (`user.transcription` / `avatar.transcription`) — proste dopasowanie
   słów kluczowych, nie wywołanie LLM-a (przy tylko 3 wyraźnie odrębnych
   polskich nazwach jest równie niezawodne i praktycznie darmowe/natychmiastowe;
@@ -130,7 +219,7 @@ Co działa już teraz:
   faktycznie zasilają regułę aktywnego ćwiczenia, plus tekstowy odczyt
   aktualnej wartości (kąt/stosunek) do kalibracji progów na żywo.
 
-**Progi w `posture-rules.js` to wstępne zgadywanie** (140° dla łokcia, 0.15
+**Progi w sekcji `detekcja` plików `asany/*.json` to wstępne zgadywanie** (140° dla łokcia, 0.15
 ucho/tułów, 0.2 biodro/kolano, 0.25 pięta/czubek stopy, 80-120° dla kolana
 w Wojowniku II, ±0.2 dla ręce/barki) — do skalibrowania patrząc na realne
 nagranie testera w kamerze (patrz tekstowy odczyt na podglądzie kamery), nie
@@ -143,9 +232,11 @@ Co trzeba dopiąć:
 - Wciągnięcie pamięci usera (`memory.js`/`loadMemoryContext`) do promptu
   korekty/pochwały — np. nie dociskać korekty, jeśli user wcześniej zgłosił
   ból. Baza już istnieje, brakuje tylko podpięcia.
-- Powrót `cat_cow` (albo kolejnych ćwiczeń) wymaga najpierw własnych reguł
-  geometrycznych w `posture-rules.js` — samo dopisanie do `posture.js` nie
-  wystarczy (auto-detekcja z rozmowy zadziała, ale reguły — nie).
+- Powrót `cat_cow` (albo kolejnych ćwiczeń) to dziś dodanie pliku
+  `asany/<id>.json` — trener i auto-detekcja podłapią pozycję od razu, ale
+  korekta z kamery zadziała dopiero, gdy plik dostanie własną sekcję `detekcja`
+  (dla `cat_cow` to wciąż otwarty problem: MediaPipe nie daje landmarków na
+  kręgosłup, więc nie ma z czego policzyć krzywizny).
 - Źródło: `docs.liveavatar.com/docs/full-mode/events.md` (topic
   `agent-control`, komendy `avatar.speak_text` / `avatar.speak_response` /
   `avatar.interrupt`) — stary link z komentarza w `server.js`
@@ -191,6 +282,7 @@ mikrofon (Web Speech API, pl-PL) --> Groq LLM (llama-3.3-70b, streaming)
 - Transkrypcję robi Web Speech API w przeglądarce (wybrane zamiast Groq Whisper — niższa latencja i prostszy kod, patrz komentarz przy adapterze w `public/index.html`); finalny tekst leci do `POST /api/lite-turn`.
 - Backend strumieniuje odpowiedź Groq zdanie po zdaniu do ElevenLabs (`stream-input` WebSocket, `output_format=pcm_24000` — dokładnie format wymagany przez LiveAvatar Lite, zero resamplingu) i przekazuje przychodzące audio do `ws_url` w kawałkach (pierwszy ~600ms, kolejne ~1s), więc awatar zaczyna mówić, zanim LLM skończy całą odpowiedź.
 - Postęp per ogniwo (STT gotowe / pierwszy token LLM / pierwszy chunk TTS / awatar zaczyna mówić) leci do przeglądarki przez `GET /api/lite-events` (Server-Sent Events) i loguje się tym samym formatem `LATENCJA ODPOWIEDZI: X ms`, co pozostałe adaptery — wyniki są bezpośrednio porównywalne.
+- Punkt startowy tego pomiaru jest jawnie oznaczony w logu: `(od ciszy)` = od `onspeechend` Web Speech API, czyli odpowiednik `user.speak_ended` u pozostałych dostawców (porównywalne); `(od gotowego tekstu, bez narzutu STT)` = Chrome nie dał dla tej wypowiedzi sygnału ciszy, więc liczymy od finalnego transkryptu i wynik jest **zaniżony** o narzut STT. Znacznik ciszy jest ważny tylko dla wypowiedzi, na której finalny transkrypt aktualnie czekamy — Chrome odpala `speechend` również po `stop()` i po echu głosu awatara, a taki osierocony znacznik przeciekał wcześniej do następnej sesji i dawał w logu latencje rzędu minut.
 - Session Recorder i pamięć (Supabase) działają przez ten sam mechanizm co pozostałe adaptery LiveAvatar — bez osobnej ścieżki: backend sam woła `recordLiveAvatarEvent()` dla `user.transcription`/`avatar.transcription` (ma ten tekst od razu, bez przekazywania przez przeglądarkę), a zamknięcie sesji robi ten sam upsert do `avatar_sessions` i tę samą ekstrakcję pamięci przez Groq.
 - Zamykanie sesji Lite różni się od Full: dokumentacja HeyGena podaje `DELETE /v1/sessions`, co w testach zwracało 405. Działający sposób (zweryfikowany bezpośrednio) to `POST /v1/sessions/stop` z `Authorization: Bearer <session_token>` (nie `X-API-KEY` jak w Full mode) — tak zaimplementowano `endSession()` tego adaptera.
 - Barge-in (przerywanie awatara w trakcie mówienia) działa: przeglądarka wykrywa nową mowę usera podczas `liteAvatarSpeaking` (z buforem ~600ms po starcie mówienia awatara, żeby resztkowy wynik rozpoznawania własnej, dopiero co wysłanej wypowiedzi nie przerywał sam siebie) i woła `POST /api/lite-interrupt`, który przerywa Groq (`AbortController`) oraz LiveAvatar (`agent.interrupt`). **Bez słuchawek** ten bufor sam w sobie nie wystarczał: głos awatara leciał z głośników z powrotem do mikrofonu, Web Speech API słyszało to jako "użytkownika" i po 600ms wciąż potrafiło przerwać resztę wypowiedzi jej własnym echem (a potem wysłać to jako user turn do Groq, który odpowiadał na coś zupełnie nie na temat). Dlatego doszła druga warstwa: `isLikelyEcho()` w `public/index.html` porównuje usłyszany tekst z tym, co avatar aktualnie mówi (`liteLastAvatarUtterance`, z SSE `avatar_transcription`) i ignoruje wynik, gdy pokrywa się w ≥60% słów — prawdziwe przerwanie (inne słowa niż avatar) nadal działa normalnie.

@@ -1,10 +1,16 @@
-// Deklaratywny rejestr reguł geometrycznych — CO mierzymy i jakie są progi
-// (wiedza domenowa o jodze). JAK mierzyć (silnik: computeAngle, computeRatio,
-// evaluateRule, wygładzanie, wybór widocznej strony) żyje w pose-detector.js,
-// który nie wie nic o jodze — ta sama granica co między server.js (logika) a
-// posture.js (teksty korekt/keywordy).
+// Reguły geometryczne — CO mierzymy i jakie są progi (wiedza domenowa o
+// jodze) — NIE są już wpisane w tym pliku. Ich źródłem jest sekcja "detekcja"
+// w asany/<id>.json (patrz asany.js), serwowana przeglądarce przez
+// GET /api/asany/detekcja: front-end nie czyta dysku, a metodyk ma progi w tym
+// samym pliku co treść pozycji. Ten moduł jest teraz tylko klientem tego
+// endpointu i cache'em na czas życia karty.
 //
-// Kształt reguły:
+// JAK mierzyć (silnik: computeAngle, computeRatio, evaluateRule, wygładzanie,
+// wybór widocznej strony) nadal żyje w pose-detector.js, który nie wie nic o
+// jodze — ta sama granica co między server.js (logika) a posture.js (teksty).
+//
+// Kształt reguły (walidowany po stronie serwera przez asany.js, tu przyjmowany
+// bez tłumaczenia — dlatego pola zostały po angielsku 1:1):
 //   type: "angle" | "ratio"
 //   label: tekst do podglądu na żywo (odczyt kąta/ratio na canvasie kamery)
 //   points: { left: [idx...], right: [idx...] } — pickVisibleSide (w
@@ -18,115 +24,35 @@
 //     (błąd postawy), gdy wartość WYCHODZI poza [min, max]. Można podać tylko
 //     jedno z nich (brak dolnej albo górnej granicy).
 //
-// `cat_cow` nie ma tu wpisu świadomie: oba jego odchylenia (back_flat,
-// neck_strain) opisują krzywiznę kręgosłupa/karku, a MediaPipe Pose nie daje
-// żadnego landmarku na kręgosłup (tylko ramiona i biodra — 2 punkty nie
-// pokażą krzywizny) — zostają ręczne z dropdowna, zamiast zgadywać
-// niewiarygodną regułę.
-import { IDX, deriveHighlightIndices } from "./pose-detector.js";
+// Pozycja bez sekcji "detekcja" (albo z "aktywna": false) po prostu nie trafia
+// z serwera — tak jak dawniej `cat_cow` świadomie nie miał tu wpisu, bo jego
+// odchylenia opisują krzywiznę kręgosłupa, a MediaPipe Pose nie daje żadnego
+// landmarku na kręgosłup (tylko ramiona i biodra — 2 punkty nie pokażą
+// krzywizny). Taka pozycja działa normalnie w rozmowie, tylko bez korekty z kamery.
+import { deriveHighlightIndices } from "./pose-detector.js";
 
-export const RULES = {
-  child_pose: {
-    // Wyprostowana ręka ~180°, wyraźnie ugięta/schowana < 140°.
-    arms_not_extended: {
-      type: "angle",
-      label: "kąt łokcia",
-      points: {
-        left: [IDX.leftShoulder, IDX.leftElbow, IDX.leftWrist],
-        right: [IDX.rightShoulder, IDX.rightElbow, IDX.rightWrist],
-      },
-      min: 140,
-    },
-    // (kolano.y - biodro.y) / (biodro.y - bark.y). Dodatnie = biodro wyżej
-    // niż kolano. Najlepiej widoczne z boku — z przodu kolano i biodro mogą
-    // się nakładać na obrazie, więc to zgrubna reguła.
-    hips_too_high: {
-      type: "ratio",
-      label: "biodro nad kolanem",
-      points: {
-        left: [IDX.leftShoulder, IDX.leftHip, IDX.leftKnee],
-        right: [IDX.rightShoulder, IDX.rightHip, IDX.rightKnee],
-      },
-      numerator: [1, 2],
-      denominator: [0, 1],
-      max: 0.2,
-    },
-  },
-  downward_dog: {
-    // (bark.y - ucho.y) / (biodro.y - bark.y). Barki podciągnięte do uszu ->
-    // mały stosunek.
-    shoulders_shrugged: {
-      type: "ratio",
-      label: "ucho/tułów",
-      points: {
-        left: [IDX.leftEar, IDX.leftShoulder, IDX.leftHip],
-        right: [IDX.rightEar, IDX.rightShoulder, IDX.rightHip],
-      },
-      numerator: [0, 1],
-      denominator: [1, 2],
-      min: 0.15,
-    },
-    // (czubek.y - pięta.y) / (kostka.y - kolano.y). Dodatnie = pięta wyżej
-    // niż czubek stopy. To jedyna z pierwotnie "trudnych" reguł, którą jednak
-    // da się policzyć bez punktu odniesienia do podłogi — MediaPipe ma
-    // osobne landmarki na piętę I czubek stopy.
-    heels_lifted: {
-      type: "ratio",
-      label: "pięta nad czubkiem stopy",
-      points: {
-        left: [IDX.leftKnee, IDX.leftAnkle, IDX.leftHeel, IDX.leftFootIndex],
-        right: [IDX.rightKnee, IDX.rightAnkle, IDX.rightHeel, IDX.rightFootIndex],
-      },
-      numerator: [2, 3],
-      denominator: [0, 1],
-      max: 0.25,
-    },
-  },
-  // NOWE — progi wstępne/zgadywane, tak jak 4 reguły wyżej (patrz README,
-  // sekcja "Sprint 2"): wymagają kalibracji na realnym nagraniu testera, nie
-  // są sztywnymi liczbami z podręcznika biomechaniki.
-  warrior_2: {
-    // Kąt biodro-kolano-kostka przedniej nogi. Docelowo ~90°. Pasmo 80-120°
-    // to celowo szeroki "gruby błąd" (jak 140° dla łokcia), nie precyzyjna
-    // biomechanika.
-    // UWAGA: pickVisibleSide (w evaluateRule) wybiera stronę PO WIDOCZNOŚCI,
-    // nie po tym, która noga jest anatomicznie "przednia" — w typowym
-    // ustawieniu Wojownika II (bok do kamery) obie nogi bywają podobnie
-    // widoczne, więc która noga faktycznie zostanie zmierzona może być
-    // niedeterministyczne między klatkami/sesjami. Świadome uproszczenie w
-    // tym refaktorze — właściwe rozróżnienie przedniej/tylnej nogi wymaga
-    // znajomości orientacji użytkownika względem kamery, co należy do
-    // przyszłego zadania z klasyfikatorem/maszyną stanów.
-    front_knee_not_bent: {
-      type: "angle",
-      label: "kąt kolana",
-      points: {
-        left: [IDX.leftHip, IDX.leftKnee, IDX.leftAnkle],
-        right: [IDX.rightHip, IDX.rightKnee, IDX.rightAnkle],
-      },
-      min: 80,
-      max: 120,
-    },
-    // (nadgarstek.y - bark.y) / (biodro.y - bark.y). Dodatnie = ręka opadła
-    // niżej barku, ujemne = ręka uniesiona powyżej barku — oba to "nie na
-    // wysokości barków", stąd symetryczne pasmo ±0.2 (rząd wielkości innych
-    // ratio w tym rejestrze, np. hips_too_high).
-    arms_not_level: {
-      type: "ratio",
-      label: "nadgarstek vs linia barków",
-      points: {
-        left: [IDX.leftShoulder, IDX.leftHip, IDX.leftWrist],
-        right: [IDX.rightShoulder, IDX.rightHip, IDX.rightWrist],
-      },
-      numerator: [0, 2],
-      denominator: [0, 1],
-      min: -0.2,
-      max: 0.2,
-    },
-  },
-};
+let RULES = {};
+let HIGHLIGHT_INDICES = {};
 
-// Wyprowadzone z RULES zamiast ręcznie utrzymywane osobno — patrz
-// deriveHighlightIndices w pose-detector.js (dodanie/zmiana reguły nie może
-// tu po cichu rozjechać się z tym, co faktycznie się podświetla).
-export const HIGHLIGHT_INDICES = deriveHighlightIndices(RULES);
+// Wołane raz przy starcie strony. Błąd sieci nie może wywalić apki: rejestr
+// zostaje pusty, rulesFor() zwraca null i cały tor korekty po prostu milczy
+// (ta sama graceful degradation co przy braku danych kalibracyjnych k-NN).
+export async function loadPostureRules() {
+  const res = await fetch("/api/asany/detekcja");
+  if (!res.ok) throw new Error(`GET /api/asany/detekcja zwrócił ${res.status}`);
+  const { reguly } = await res.json();
+  RULES = reguly || {};
+  // Wyprowadzone z RULES zamiast utrzymywane osobno — patrz
+  // deriveHighlightIndices w pose-detector.js (zmiana reguły nie może po cichu
+  // rozjechać się z tym, co faktycznie się podświetla na podglądzie kamery).
+  HIGHLIGHT_INDICES = deriveHighlightIndices(RULES);
+  return Object.keys(RULES);
+}
+
+export function rulesFor(exercise) {
+  return RULES[exercise] || null;
+}
+
+export function highlightIndicesFor(exercise) {
+  return HIGHLIGHT_INDICES[exercise] || [];
+}

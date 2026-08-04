@@ -1,0 +1,48 @@
+{
+  "id": "child_pose",
+  "nazwa": "Pozycja dziecka",
+  "sanskryt": "Balasana",
+  "typ": "relaksacyjna",
+  "poziom_min": "niska",
+  "odpoczynkowa": true,
+  "slowa_kluczowe": ["pozycja dziecka", "pozycji dziecka", "pozycję dziecka"],
+
+  "obciaza": ["knee_left", "knee_right", "ankle_left", "ankle_right"],
+  "przeciwwskazania_twarde": ["knee_left", "knee_right"],
+  "przeciwwskazania_miekkie": ["ankle_left", "ankle_right", "lower_back"],
+
+  "czasy_trzymania_oddechy": { "niska": 5, "srednia": 8, "wysoka": 10 },
+
+  "skrypty": {
+    "wejscie": "Usiądź na piętach, pochyl tułów do przodu, czoło na macie, ręce swobodnie przed sobą albo wzdłuż ciała.",
+    "trzymanie": "Oddychaj spokojnie w plecy... z każdym wydechem pozwól biodrom osiadać niżej na piętach.",
+    "wyjscie": "Na wdechu powoli unieś tułów... wróć do siadu na piętach i zostań tu chwilę.",
+    "modyfikacja_lagodna": "Jeśli kolana protestują, rozsuń je szerzej i połóż zwinięty koc między pośladkami a piętami."
+  },
+
+  "detekcja": {
+    "aktywna": true,
+    "reguly": [
+      {
+        "id": "arms_not_extended",
+        "etykieta": "Ręce za mało wyciągnięte",
+        "korekta": "Wyciągnij ręce dalej przed siebie... poczuj rozciąganie w plecach.",
+        "type": "angle",
+        "label": "kąt łokcia",
+        "points": { "left": [11, 13, 15], "right": [12, 14, 16] },
+        "min": 140
+      },
+      {
+        "id": "hips_too_high",
+        "etykieta": "Biodra za wysoko",
+        "korekta": "Opuść biodra bliżej pięt... pozwól ciału opaść.",
+        "type": "ratio",
+        "label": "biodro nad kolanem",
+        "points": { "left": [11, 23, 25], "right": [12, 24, 26] },
+        "numerator": [1, 2],
+        "denominator": [0, 1],
+        "max": 0.2
+      }
+    ]
+  }
+}

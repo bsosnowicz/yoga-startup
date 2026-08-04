@@ -12,6 +12,7 @@ const crypto = require("crypto");
 const { buildCoachPrompt, extractionPrompt, parseExtraction } = require("./memory");
 const { PROFILE_KEYS, PREFERENCE_KEYS, SESSION_KEYS } = require("./memory-schema");
 const { buildPostureCue, buildPostureAffirmation, listExerciseCues, buildPostureMismatchCue } = require("./posture");
+const { getAsanyDoDetekcji, asanyDoPromptu } = require("./asany");
 const { appendCalibrationRecording, loadAllCalibrations } = require("./calibration");
 
 // Minimalna obsługa .env bez dokładania zależności do tego małego testowego
@@ -341,14 +342,32 @@ async function persistRecordedSession(record, endReason = null) {
 // System prompt trenerki jogi — dla Anam trafia bezpośrednio jako
 // personaConfig.systemPrompt, dla LiveAvatar trzeba go ręcznie wkleić jako
 // treść Contextu w ich API/dashboardzie (patrz TODO przy providerze liveavatar).
-const TRAINER_SYSTEM_PROMPT = `[STYLE] Odpowiadaj wyłącznie po polsku, naturalną mową bez formatowania,
+//
+// Sekcja [ASANY] jest GENEROWANA z asany/*.json (patrz asanyDoPromptu w
+// asany.js), nie wpisana ręcznie. Wcześniej lista pozycji siedziała w prozie
+// ("poprowadź go przez pozycję dziecka i psa z głową w dół") i rozjeżdżała się
+// z resztą systemu: warrior_2 miał komplet reguł detekcji i słów kluczowych,
+// ale trener nigdy go nie zadawał, bo prompt o nim nie wiedział. Teraz dodanie
+// pliku JSON wystarczy, żeby pozycja pojawiła się w prompcie i w auto-detekcji.
+function buildTrainerPrompt() {
+  const lista = asanyDoPromptu();
+  const sekcjaAsan = lista
+    ? `[ASANY] Prowadź WYŁĄCZNIE przez poniższe pozycje i nazywaj je dokładnie tak, jak
+tutaj zapisano. Liczbę oddechów w trzymaniu i samą pozycję dobierz do kondycji,
+którą zadeklarował użytkownik. Jeśli prosi o coś łagodniejszego, użyj wariantu
+"łagodniej" zamiast rezygnować z pozycji.
+${lista}`
+    : `[ASANY] Nie masz wczytanej żadnej pozycji — poprowadź spokojną sesję oddechową
+i nie proponuj konkretnych asan.`;
+
+  return `[STYLE] Odpowiadaj wyłącznie po polsku, naturalną mową bez formatowania,
 krótkimi zdaniami. Dodawaj pauzy używając '...'. Mów spokojnie i ciepło.
 [PERSONALITY] Jesteś Andrzej, doświadczonym trenerem jogi. Prowadzisz użytkownika przez
 krótką sesję. Na początku zapytaj, ile ma dziś czasu i jak ocenia swoją kondycję.
-Potem poprowadź go przez pozycję dziecka i psa z głową w dół (dokładnie tymi
-nazwami): powiedz jak wejść w pozycję, przypominaj o oddechu, po kilku
-oddechach powiedz jak wyjść. Reaguj na to, co mówi użytkownik -
-jeśli mówi, że coś boli albo że musi kończyć, dostosuj się natychmiast.
+Potem poprowadź go przez pozycje z sekcji [ASANY]: powiedz jak wejść w pozycję,
+przypominaj o oddechu, po kilku oddechach powiedz jak wyjść. Reaguj na to, co
+mówi użytkownik - jeśli mówi, że coś boli albo że musi kończyć, dostosuj się natychmiast.
+${sekcjaAsan}
 [POSTAWA] Nie widzisz fizycznie użytkownika, więc nigdy nie zgaduj ani nie
 wymyślaj konkretnych, technicznych błędów postawy (np. "masz źle ustawione
 kolano") — to mogłoby wprowadzić w błąd. Jeśli user zapyta, czy dobrze robi
@@ -357,6 +376,9 @@ pozycję, odpowiedz ciepło i zachęcająco, bez wymyślonych szczegółów (np.
 Nigdy nie wspominaj o żadnym oddzielnym systemie, mechanizmie czy narzędziu
 do korekty postawy — po prostu bądź wspierającym trenerem, jednym spójnym
 głosem.`;
+}
+
+const TRAINER_SYSTEM_PROMPT = buildTrainerPrompt();
 
 // Styl-guide korekt postawy — startowy, do dopracowania przez prawdziwego
 // trenera jogi. Karmi generateGroqCorrection() niżej: trener pisze te zasady
@@ -1478,6 +1500,24 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/api/posture-cues") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ exercises: listExerciseCues() }));
+    return;
+  }
+
+  // Reguły geometryczne z sekcji "detekcja" plików asany/*.json — front-end
+  // nie czyta dysku, więc dostaje je stąd (patrz loadPostureRules w
+  // public/posture-rules.js). Przekształcamy tablicę reguł na mapę
+  // ćwiczenie -> odchylenie -> reguła: pliki JSON są tablicami, bo tak wygodniej
+  // je edytować metodykowi, a silnik (evaluateRule w pose-detector.js) i tak
+  // adresuje regułę po id odchylenia.
+  if (req.method === "GET" && req.url === "/api/asany/detekcja") {
+    const reguly = Object.fromEntries(
+      getAsanyDoDetekcji().map((asana) => [
+        asana.id,
+        Object.fromEntries(asana.detekcja.reguly.map(({ id, etykieta, korekta, ...regula }) => [id, regula])),
+      ])
+    );
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ reguly }));
     return;
   }
 

@@ -1,0 +1,50 @@
+{
+  "id": "downward_dog",
+  "nazwa": "Pies z głową w dół",
+  "sanskryt": "Adho Mukha Svanasana",
+  "typ": "rozciaganie",
+  "poziom_min": "niska",
+  "odpoczynkowa": false,
+  "slowa_kluczowe": ["pies z głową w dół", "psa z głową w dół", "pies głową w dół", "adho mukha"],
+
+  "obciaza": ["shoulder_left", "shoulder_right", "wrist_left", "wrist_right"],
+  "przeciwwskazania_twarde": ["wrist_left", "wrist_right"],
+  "przeciwwskazania_miekkie": ["calf_left", "calf_right"],
+
+  "czasy_trzymania_oddechy": { "niska": 3, "srednia": 5, "wysoka": 8 },
+
+  "skrypty": {
+    "wejscie": "Z czworaka unieś biodra do góry, wyprostuj nogi i ręce na tyle, na ile możesz, głowa swobodnie między ramionami.",
+    "trzymanie": "Rozłóż ciężar na całe dłonie... oddychaj równo i wydłużaj plecy od dłoni aż do bioder.",
+    "wyjscie": "Na wydechu ugnij kolana i opuść się z powrotem na czworaka... usiądź na piętach.",
+    "modyfikacja_lagodna": "Ugnij kolana tak mocno, jak potrzebujesz... długie plecy są ważniejsze niż wyprostowane nogi."
+  },
+
+  "detekcja": {
+    "aktywna": true,
+    "reguly": [
+      {
+        "id": "shoulders_shrugged",
+        "etykieta": "Barki podniesione do uszu",
+        "korekta": "Odciągnij barki od uszu... wydłuż kark.",
+        "type": "ratio",
+        "label": "ucho/tułów",
+        "points": { "left": [7, 11, 23], "right": [8, 12, 24] },
+        "numerator": [0, 1],
+        "denominator": [1, 2],
+        "min": 0.15
+      },
+      {
+        "id": "heels_lifted",
+        "etykieta": "Pięty uniesione",
+        "korekta": "Spróbuj opuścić pięty bliżej maty.",
+        "type": "ratio",
+        "label": "pięta nad czubkiem stopy",
+        "points": { "left": [25, 27, 29, 31], "right": [26, 28, 30, 32] },
+        "numerator": [2, 3],
+        "denominator": [0, 1],
+        "max": 0.25
+      }
+    ]
+  }
+}

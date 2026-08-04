@@ -84,7 +84,7 @@
     import { Room, RoomEvent } from "https://esm.sh/livekit-client@2";
     import Daily from "https://esm.sh/@daily-co/daily-js";
     import { createPoseDetector, evaluateRule, createValueSmoother, createDeviationDebouncer, drawLandmarks, summarizeCalibrationAngles } from "./pose-detector.js";
-    import { RULES, HIGHLIGHT_INDICES } from "./posture-rules.js";
+    import { loadPostureRules, rulesFor, highlightIndicesFor } from "./posture-rules.js";
     import { createKnnClassifier } from "./knn.js";
     import { createPostureStateMachine } from "./posture-state-machine.js";
 
@@ -198,6 +198,11 @@
     let liteAvatarSpeaking = false;
     let liteAvatarSpeakingStartedAt = 0;
     let liteSpeechEndedAt = null;
+    // Czy czekamy na finalny transkrypt bieżącej wypowiedzi. Tylko wtedy
+    // znacznik ciszy (onspeechend) należy do tej wypowiedzi — patrz komentarz
+    // przy onspeechend niżej.
+    let liteAwaitingFinal = false;
+    let liteLatencyFromSilence = false; // z czego policzono liteUserSpeakEndedAt (cisza vs gotowy tekst)
     let liteLastAvatarUtterance = ""; // do wykrywania echa własnego głosu awatara w mikrofonie, patrz isLikelyEcho niżej
 
     // Bez słuchawek głos awatara leci z głośników z powrotem do mikrofonu —
@@ -733,7 +738,11 @@
               // LiveAvatar (sieć + render), bez domieszki front-end/STT.
               log(`Awatar zaczyna mówić... (backend: ${data.ms} ms od startu tury)`);
               if (liteUserSpeakEndedAt !== null) {
-                log(`LATENCJA ODPOWIEDZI: ${Math.round(performance.now() - liteUserSpeakEndedAt)} ms`);
+                // Zaznaczamy, od czego liczony jest ten pomiar: "od ciszy" jest
+                // porównywalne z innymi dostawcami, "od gotowego tekstu" NIE
+                // zawiera narzutu STT (Web Speech nie dał sygnału ciszy).
+                const from = liteLatencyFromSilence ? "od ciszy" : "od gotowego tekstu, bez narzutu STT";
+                log(`LATENCJA ODPOWIEDZI: ${Math.round(performance.now() - liteUserSpeakEndedAt)} ms (${from})`);
                 liteUserSpeakEndedAt = null;
               }
             } else if (data.stage === "avatar_speak_ended") { liteAvatarSpeaking = false; log("Awatar skończył mówić."); }
@@ -776,8 +785,17 @@
           // pipeline'u nie widzi. Liczymy LATENCJA ODPOWIEDZI od onspeechend
           // (odpowiednik "user.speak_ended" u innych dostawców), nie od
           // onresult, żeby liczba była uczciwa i porównywalna z resztą.
-          liteRecognition.onspeechend = () => { liteSpeechEndedAt = performance.now(); };
+          //
+          // Znacznik zapisujemy TYLKO gdy czekamy na finalny transkrypt, bo
+          // Chrome odpala speechend też tam, gdzie żaden finalny wynik już nie
+          // przyjdzie: asynchronicznie po recognition.stop() (czyli po
+          // disconnect(), już po wyzerowaniu stanu) oraz po echu głosu awatara
+          // z głośników. Taki osierocony znacznik przeżywał do NASTĘPNEJ sesji
+          // i dawał w logu latencje rzędu minut (np. 322458 ms = czas od
+          // rozłączenia poprzedniej sesji), zamiast realnych ~1000 ms.
+          liteRecognition.onspeechend = () => { if (liteAwaitingFinal) liteSpeechEndedAt = performance.now(); };
           liteRecognition.onresult = (ev) => {
+            if (!liteRecognitionActive) return; // wyniki dochodzące po stop() nie należą już do żadnej sesji
             clearTimeout(liteSpeechWatchdog);
             const result = ev.results[ev.results.length - 1];
             const heard = result[0].transcript.trim();
@@ -788,9 +806,18 @@
             // ignorujemy: bez tego takie echo wywoływało barge-in i leciało
             // dalej jako "user turn" do Groq.
             if (liteAvatarSpeaking && isLikelyEcho(heard, liteLastAvatarUtterance)) {
-              if (result.isFinal) log("(Zignorowano echo własnego głosu awatara w mikrofonie.)");
+              if (result.isFinal) {
+                log("(Zignorowano echo własnego głosu awatara w mikrofonie.)");
+                // Cisza po echu nie jest końcem wypowiedzi użytkownika —
+                // odrzucamy znacznik razem z samym echem.
+                liteAwaitingFinal = false;
+                liteSpeechEndedAt = null;
+              }
               return;
             }
+            // Od tego momentu wiemy, że to mowa użytkownika: wynik cząstkowy
+            // uzbraja znacznik ciszy dla tej wypowiedzi, finalny go rozbraja.
+            liteAwaitingFinal = !result.isFinal;
             // Barge-in: sprawdzamy na KAŻDYM wyniku (nawet cząstkowym), nie
             // tylko w onspeechstart — w trybie continuous Chrome odpala
             // onspeechstart tylko raz dla pierwszej wypowiedzi w całej
@@ -820,8 +847,13 @@
               log(`  ↳ narzut STT (cisza → tekst gotowy): ${Math.round(performance.now() - liteSpeechEndedAt)} ms`);
               liteUserSpeakEndedAt = liteSpeechEndedAt;
               liteSpeechEndedAt = null;
+              liteLatencyFromSilence = true;
             } else {
-              liteUserSpeakEndedAt = performance.now(); // brak onspeechend (rzadkie) — fallback jak wcześniej
+              // Brak sygnału ciszy dla tej wypowiedzi (Chrome w trybie
+              // continuous odpala speechend nieregularnie) — mierzymy od
+              // gotowego tekstu i mówimy o tym wprost w logu latencji.
+              liteUserSpeakEndedAt = performance.now();
+              liteLatencyFromSilence = false;
             }
             logDatabase("→ lite-turn", { sessionId, text });
             fetch("/api/lite-turn", {
@@ -838,8 +870,16 @@
           };
           liteRecognition.onerror = (ev) => { clearTimeout(liteSpeechWatchdog); log(`(Web Speech API: ${ev.error})`); };
           // Chrome ubija ciągłe rozpoznawanie po dłuższej ciszy — wznawiamy
-          // automatycznie, dopóki sesja jest aktywna.
-          liteRecognition.onend = () => { if (liteRecognitionActive) liteRecognition.start(); };
+          // automatycznie, dopóki sesja jest aktywna. Restart zamyka bieżącą
+          // wypowiedź: znacznik ciszy nie doczeka się już finalnego wyniku.
+          liteRecognition.onend = () => {
+            liteAwaitingFinal = false;
+            liteSpeechEndedAt = null;
+            if (liteRecognitionActive) liteRecognition.start();
+          };
+          liteSpeechEndedAt = null;
+          liteUserSpeakEndedAt = null;
+          liteAwaitingFinal = false;
           liteRecognitionActive = true;
           liteRecognition.start();
           log("Mikrofon (Web Speech) aktywny. Mów!");
@@ -857,6 +897,8 @@
           liteRecognitionActive = false;
           liteAvatarSpeaking = false;
           liteSpeechEndedAt = null;
+          liteUserSpeakEndedAt = null;
+          liteAwaitingFinal = false;
           clearTimeout(liteSpeechWatchdog);
           if (liteRecognition) { try { liteRecognition.stop(); } catch (_) {} liteRecognition = null; }
           if (liteEventSource) { liteEventSource.close(); liteEventSource = null; }
@@ -907,6 +949,14 @@
       postureExercises = exercises;
     }
     loadPostureCues();
+
+    // Progi reguł postawy przychodzą z asany/*.json przez serwer (patrz
+    // loadPostureRules w posture-rules.js). Ładujemy je od razu przy starcie
+    // strony, bo kamerę można włączyć w każdej chwili; nieudane pobranie
+    // wycisza tylko korektę z kamery, reszta apki działa normalnie.
+    loadPostureRules()
+      .then((ids) => log(`Reguły postawy: wczytano dla ${ids.length} pozycji (${ids.join(", ") || "brak"}).`))
+      .catch((e) => log(`(Reguły postawy niedostępne: ${e.message} — korekta z kamery będzie milczeć.)`));
 
     function detectActiveExercise(text) {
       if (!text) return;
@@ -1054,11 +1104,11 @@
           }
 
           const exercise = activeExercise;
-          const rules = exercise ? RULES[exercise] : null;
+          const rules = exercise ? rulesFor(exercise) : null;
           drawLandmarks(poseCanvasCtx, landmarks, {
             width: poseCanvas.width,
             height: poseCanvas.height,
-            highlightIndices: exercise ? HIGHLIGHT_INDICES[exercise] || [] : [],
+            highlightIndices: exercise ? highlightIndicesFor(exercise) : [],
           });
           if (!exercise) {
             poseCanvasCtx.save();

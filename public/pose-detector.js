@@ -1,9 +1,9 @@
 // MediaPipe Pose (100% w przeglądarce, bez konta/klucza) — silnik oceny
 // reguł geometrycznych do wykrywania "grubych błędów" postawy, PoC, nie
 // pełna biomechanika. API zweryfikowane na developers.google.com/edge/mediapipe.
-// Same reguły (CO mierzymy, jakie progi) żyją deklaratywnie w
-// posture-rules.js — 6 z 8 odchyleń z posture.js ma tu regułę (patrz
-// komentarz przy RULES w posture-rules.js dla reszty).
+// Same reguły (CO mierzymy, jakie progi) żyją deklaratywnie w sekcji
+// "detekcja" plików asany/<id>.json i docierają tu przez posture-rules.js,
+// który pobiera je z GET /api/asany/detekcja.
 //
 // Landmarki (33 punkty, indeksy MediaPipe Pose):
 export const IDX = {
