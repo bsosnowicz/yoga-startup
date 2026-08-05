@@ -10,9 +10,9 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { buildCoachPrompt, extractionPrompt, parseExtraction } = require("./memory");
-const { PROFILE_KEYS, PREFERENCE_KEYS, SESSION_KEYS } = require("./memory-schema");
+const { PROFILE_KEYS, PREFERENCE_KEYS, SESSION_KEYS, bodyPartLabel, severityLabel } = require("./memory-schema");
 const { buildPostureCue, buildPostureAffirmation, listExerciseCues, buildPostureMismatchCue } = require("./posture");
-const { getAsanyDoDetekcji, asanyDoPromptu } = require("./asany");
+const { getAsanyDoDetekcji, asanyDoPromptu, filterAsanas, excludedAsanasToPrompt } = require("./asany");
 const { appendCalibrationRecording, loadAllCalibrations } = require("./calibration");
 
 // Minimalna obsługa .env bez dokładania zależności do tego małego testowego
@@ -28,7 +28,11 @@ function loadEnvFile(filename = path.join(__dirname, ".env")) {
 }
 loadEnvFile();
 
-const GROQ_TRAINER_PROMPT = "Jesteś przyjaznym trenerem jogi. Rozmawiasz po polsku. Odpowiadaj krótko i naturalnie. Nie widzisz fizycznie użytkownika, więc nigdy nie zgaduj ani nie wymyślaj konkretnych, technicznych błędów postawy (np. \"masz źle ustawione kolano\") — to mogłoby wprowadzić w błąd. Jeśli user zapyta, czy dobrze robi pozycję, odpowiedz ciepło i zachęcająco, bez wymyślonych szczegółów (np. \"Skup się na oddechu, idzie Ci dobrze... daj znać, jeśli coś Cię boli\"). Nigdy nie wspominaj o żadnym oddzielnym systemie, mechanizmie czy narzędziu do korekty postawy — po prostu bądź wspierającym trenerem, jednym spójnym głosem.";
+// GROQ_TRAINER_PROMPT (osobna, krótsza persona bez sekcji [ASANY]) został
+// usunięty przy wprowadzaniu twardego filtra wykluczeń: provider liveavatarGroq
+// dostawał przez niego prompt BEZ listy pozycji, więc nie było czego filtrować,
+// a trener i tak improwizował asany spoza rejestru. Oba providery LiveAvatar
+// używają teraz buildTrainerPrompt() — jednej persony z filtrowaną listą asan.
 const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_flash_v2_5";
 
 // Sandbox LiveAvatar (LIVEAVATAR_SANDBOX=true) wspiera WYŁĄCZNIE tego jednego
@@ -349,16 +353,88 @@ async function persistRecordedSession(record, endReason = null) {
 // z resztą systemu: warrior_2 miał komplet reguł detekcji i słów kluczowych,
 // ale trener nigdy go nie zadawał, bo prompt o nim nie wiedział. Teraz dodanie
 // pliku JSON wystarczy, żeby pozycja pojawiła się w prompcie i w auto-detekcji.
-function buildTrainerPrompt() {
-  const lista = asanyDoPromptu();
-  const sekcjaAsan = lista
+//
+// Wynik filtrowania idzie do logu ZAWSZE, także gdy nic nie zostało wykluczone.
+// To nie jest debug: RFP wymaga egzekwowania wykluczeń, a bez wpisu w logu nie
+// da się pokazać, że filtr w danej sesji faktycznie się wykonał i co zdecydował.
+function logInjuryFilter(filterResult) {
+  if (!filterResult.activeInjuries.length) {
+    console.log(`Filtr kontuzji: brak aktywnych dolegliwości — dostępnych pozycji: ${filterResult.available.length}.`);
+    return;
+  }
+  const active = filterResult.activeInjuries
+    .map((injury) => `${bodyPartLabel(injury.body_part)} (${severityLabel(injury.severity)})`)
+    .join(", ");
+  const hard = filterResult.excluded.map((item) => `${item.asana.nazwa} [${item.reason}]`).join(", ") || "brak";
+  const gentle = filterResult.available
+    .filter((item) => item.gentleOnly)
+    .map((item) => `${item.asana.nazwa} [${item.reason}]`)
+    .join(", ") || "brak";
+
+  console.log(`Filtr kontuzji: aktywne dolegliwości: ${active}.`);
+  console.log(`Filtr kontuzji: wykluczone twardo: ${hard}.`);
+  console.log(`Filtr kontuzji: tylko wersja złagodzona: ${gentle}.`);
+  console.log(`Filtr kontuzji: dostępnych pozycji: ${filterResult.available.length}.`);
+  if (filterResult.unmapped.length) {
+    console.log(`Filtr kontuzji: zgłoszenia bez przypisania do partii ciała (nie filtrują): ${filterResult.unmapped.join(" | ")}`);
+  }
+  if (filterResult.restOnlyFallback) {
+    console.warn("Filtr kontuzji: wszystkie pozycje wykluczone — prompt zawiera wyłącznie pozycje odpoczynkowe w wersji złagodzonej.");
+  }
+  if (filterResult.noSafeAsanas) {
+    console.warn("Filtr kontuzji: brak jakiejkolwiek bezpiecznej pozycji — trener dostał instrukcję samego wyciszenia i konsultacji ze specjalistą.");
+  }
+}
+
+// `injuries` to aktywne zgłoszenia z user_injuries (getActiveInjuries wyżej).
+// Prompt musi więc powstawać PER SESJA, nie raz przy starcie procesu — stała
+// TRAINER_SYSTEM_PROMPT niżej zostaje tylko dla providerów, które nie czytają
+// pamięci użytkownika (Anam), i jest równoważna wywołaniu bez kontuzji.
+function buildTrainerPrompt({ injuries = [] } = {}) {
+  const filterResult = filterAsanas(injuries);
+  logInjuryFilter(filterResult);
+  const asanaList = asanyDoPromptu(filterResult);
+  const asanaSection = asanaList
     ? `[ASANY] Prowadź WYŁĄCZNIE przez poniższe pozycje i nazywaj je dokładnie tak, jak
 tutaj zapisano. Liczbę oddechów w trzymaniu i samą pozycję dobierz do kondycji,
 którą zadeklarował użytkownik. Jeśli prosi o coś łagodniejszego, użyj wariantu
-"łagodniej" zamiast rezygnować z pozycji.
-${lista}`
-    : `[ASANY] Nie masz wczytanej żadnej pozycji — poprowadź spokojną sesję oddechową
-i nie proponuj konkretnych asan.`;
+"łagodniej" zamiast rezygnować z pozycji. Pozycje opisane jako "WYŁĄCZNIE w
+wersji złagodzonej" prowadź tylko w tej wersji — nigdy w pełnym wariancie.${
+        filterResult.restOnlyFallback
+          ? `
+UWAGA: zgłoszone dolegliwości wykluczają dziś wszystkie pozostałe pozycje. Te
+poniżej to wyłącznie pozycje odpoczynkowe — prowadź je bardzo ostrożnie, często
+pytaj o samopoczucie i przerwij przy pierwszym sygnale bólu.`
+          : ""
+      }
+${asanaList}`
+    : `[ASANY] Zgłoszone dolegliwości wykluczają dziś wszystkie pozycje z repertuaru
+albo nie masz wczytanej żadnej pozycji. NIE proponuj żadnej asany i nie wymyślaj
+własnych. Poprowadź spokojne wyciszenie i ćwiczenie oddechowe na siedząco, a na
+koniec zasugeruj konsultację ze specjalistą przed kolejną sesją.`;
+
+  // Wykluczone pozycje MUSZĄ być w prompcie, choć nie wolno ich prowadzić.
+  // Inaczej na prośbę "zróbmy psa z głową w dół" model nie ma czym odpowiedzieć
+  // i albo udaje, że nie zna pozycji, albo ją prowadzi — pierwsze brzmi jak
+  // awaria, drugie omija filtr.
+  const excludedList = excludedAsanasToPrompt(filterResult);
+  const excludedSection = excludedList
+    ? `
+[POZYCJE WYKLUCZONE] Poniższych pozycji dziś NIE prowadzisz — użytkownik zgłosił
+dolegliwość, która je wyklucza. Nie proponuj ich sam. Jeśli użytkownik poprosi o
+którąś z nich, nie udawaj, że jej nie znasz: łagodnie odmów, krótko podaj powód
+(zgłoszona dolegliwość) i od razu zaproponuj konkretną alternatywę z [ASANY].
+${excludedList}`
+    : "";
+
+  // "other" nie mapuje się na żadną partię ciała, więc niczego nie wyklucza —
+  // ale trener ma o tym wiedzieć i móc dopytać.
+  const unmappedSection = filterResult.unmapped.length
+    ? `
+[ZGŁOSZONE DOLEGLIWOŚCI BEZ PRZYPISANIA] ${filterResult.unmapped.join(" ")}
+Nie wiadomo, których pozycji to dotyczy. Dopytaj na początku sesji, czy coś w
+tej sprawie boli w trakcie ćwiczenia, i reaguj na odpowiedź.`
+    : "";
 
   return `[STYLE] Odpowiadaj wyłącznie po polsku, naturalną mową bez formatowania,
 krótkimi zdaniami. Dodawaj pauzy używając '...'. Mów spokojnie i ciepło.
@@ -367,7 +443,7 @@ krótką sesję. Na początku zapytaj, ile ma dziś czasu i jak ocenia swoją ko
 Potem poprowadź go przez pozycje z sekcji [ASANY]: powiedz jak wejść w pozycję,
 przypominaj o oddechu, po kilku oddechach powiedz jak wyjść. Reaguj na to, co
 mówi użytkownik - jeśli mówi, że coś boli albo że musi kończyć, dostosuj się natychmiast.
-${sekcjaAsan}
+${asanaSection}${excludedSection}${unmappedSection}
 [POSTAWA] Nie widzisz fizycznie użytkownika, więc nigdy nie zgaduj ani nie
 wymyślaj konkretnych, technicznych błędów postawy (np. "masz źle ustawione
 kolano") — to mogłoby wprowadzić w błąd. Jeśli user zapyta, czy dobrze robi
@@ -683,7 +759,9 @@ const PROVIDERS = {
       const contexts = responseItems(await liveAvatarApi(apiKey, "/contexts"));
       let context = contexts.find((item) => item.name === contextName);
       const memory = await loadMemoryContext(memoryUserId());
-      const contextualPrompt = buildCoachPrompt(GROQ_TRAINER_PROMPT, memory);
+      // Prompt składany PER SESJA, bo sekcja [ASANY] zależy od aktywnych
+      // kontuzji tego użytkownika (twardy filtr wykluczeń w filterAsanas).
+      const contextualPrompt = buildCoachPrompt(buildTrainerPrompt({ injuries: memory.injuries }), memory);
       if (!context) {
         const created = await liveAvatarApi(apiKey, "/contexts", {
           method: "POST",
@@ -879,7 +957,9 @@ const PROVIDERS = {
       // Anam — scenariusze czasu/kondycji/kontuzji) + ograniczona pamięć z
       // Supabase, identycznie jak w istniejącym mechanizmie Memory Cleanup.
       const memory = await loadMemoryContext(memoryUserId());
-      const systemPrompt = buildCoachPrompt(TRAINER_SYSTEM_PROMPT, memory);
+      // Jak wyżej w liveavatarGroq: sekcja [ASANY] jest filtrowana kontuzjami
+      // użytkownika, więc prompt nie może być stałą liczoną przy starcie.
+      const systemPrompt = buildCoachPrompt(buildTrainerPrompt({ injuries: memory.injuries }), memory);
 
       const tokenData = await liveAvatarApi(apiKey, "/sessions/token", {
         method: "POST",

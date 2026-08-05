@@ -2,7 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { isBodyPart } = require("./memory-schema");
+const { isBodyPart, bodyPartLabel } = require("./memory-schema");
 
 // JEDNO ŹRÓDŁO PRAWDY o asanach: treść (nazwy, skrypty), warstwa metodyczna
 // (poziom, czasy trzymania, obciążenia, przeciwwskazania) i progi detekcji
@@ -231,25 +231,150 @@ function getAsanyDoDetekcji() {
   return listAsany().filter((asana) => asana.detekcja?.aktywna && asana.detekcja.reguly?.length > 0);
 }
 
+// ---- TWARDY FILTR WYKLUCZEŃ ZDROWOTNYCH ----
+// Decyzja "czy ta pozycja może dziś paść" zapada TUTAJ, w kodzie, a nie w
+// modelu. Sam wpis o kontuzji w prompcie nie wystarcza: w sesji testowej
+// trener, mając w kontekście zgłoszony ból prawego barku, i tak zapowiedział
+// psa z głową w dół ("ostrożnie"). Model traktuje takie zdanie jako sugestię,
+// filtr traktuje je jako regułę.
+//
+// Całość jest przecięciem dwóch zbiorów opisanych TYM SAMYM enumem BODY_PARTS:
+// aktywne kontuzje z user_injuries (getActiveInjuries w server.js) kontra
+// przeciwwskazania_twarde / przeciwwskazania_miekkie z asany/*.json. Żadnego
+// dopasowywania tekstu, żadnego zgadywania — porównanie identyfikatorów.
+
+// Kontuzje przychodzą z zapytania, które już filtruje status=eq.active i nie
+// SELECT-uje kolumny status. Brak pola traktujemy więc jako "active", ale
+// jawne "resolved" i tak odsiewamy — filtr ma być poprawny niezależnie od
+// tego, kto go woła.
+function activeInjuries(injuries) {
+  return (Array.isArray(injuries) ? injuries : []).filter(
+    (injury) => injury && isBodyPart(injury.body_part) && (injury.status || "active") === "active"
+  );
+}
+
+function bodyPartLabels(parts) {
+  return parts.map(bodyPartLabel).join(", ");
+}
+
+// severity celowo NIE wpływa na decyzję: twarde przeciwwskazanie jest twarde
+// niezależnie od nasilenia. Hook zostaje, bo różnicowanie (np. "low" degraduje
+// do wersji łagodnej zamiast wykluczać) to decyzja metodyczna Zamawiającego,
+// nie programisty — ma być podjęta świadomie, a nie wpisana tu domyślnie.
+function severityExcludes(_severity) {
+  return true;
+}
+
+function filterAsanas(injuries = []) {
+  const active = activeInjuries(injuries);
+  // "other" z definicji nie mapuje się na żadną partię, więc nie może niczego
+  // wykluczyć. Jego note idzie do promptu jako tekst, żeby trener mógł dopytać
+  // — zgadywanie partii na podstawie opisu byłoby diagnozowaniem.
+  const affected = new Set(
+    active.filter((injury) => injury.body_part !== "other" && severityExcludes(injury.severity)).map((injury) => injury.body_part)
+  );
+  const unmapped = active
+    .filter((injury) => injury.body_part === "other" && injury.note)
+    .map((injury) => injury.note);
+
+  const available = [];
+  const excluded = [];
+
+  for (const asana of listAsany()) {
+    const hard = (asana.przeciwwskazania_twarde || []).filter((part) => affected.has(part));
+    if (hard.length) {
+      excluded.push({ asana, reason: bodyPartLabels(hard) });
+      continue;
+    }
+    const soft = (asana.przeciwwskazania_miekkie || []).filter((part) => affected.has(part));
+    if (!soft.length) {
+      available.push({ asana, gentleOnly: false, reason: null });
+      continue;
+    }
+    // Miękkie przeciwwskazanie degraduje pozycję do wariantu łagodnego. Gdy
+    // metodyk nie opisał takiego wariantu (pole jest opcjonalne), nie ma czym
+    // degradować — wtedy wykluczamy, zamiast podać pełną wersję pozycji, na
+    // którą użytkownik ma przeciwwskazanie.
+    if (!asana.skrypty.modyfikacja_lagodna) {
+      excluded.push({ asana, reason: `${bodyPartLabels(soft)} (brak wariantu łagodnego w pliku asany)` });
+      continue;
+    }
+    available.push({ asana, gentleOnly: true, reason: bodyPartLabels(soft) });
+  }
+
+  // Pusta lista jest gorsza niż lista niedoskonała: trener bez repertuaru
+  // zaczyna improwizować pozycje spoza rejestru, czyli dokładnie te, których
+  // nikt nie sprawdził pod kątem przeciwwskazań. Dlatego przy wykluczeniu
+  // wszystkiego wracamy do pozycji odpoczynkowych — zawsze w wariancie
+  // łagodnym i z jawnym ostrzeżeniem w prompcie.
+  const restOnlyFallback = available.length === 0 && excluded.length > 0;
+  if (restOnlyFallback) {
+    for (const entry of excluded.filter((item) => item.asana.odpoczynkowa)) {
+      available.push({ asana: entry.asana, gentleOnly: true, reason: entry.reason });
+    }
+  }
+
+  return {
+    available,
+    excluded,
+    unmapped,
+    restOnlyFallback,
+    noSafeAsanas: available.length === 0,
+    activeInjuries: active,
+  };
+}
+
 // Renderuje listę asan do wklejenia w system prompt trenera — ten sam wzorzec
 // co bodyPartsForPrompt()/factKeysForPrompt() w memory-schema.js: moduł
 // będący źródłem danych sam wie, jak je pokazać modelowi, więc prompt nie
 // duplikuje wiedzy o kształcie tych danych.
-function asanyDoPromptu() {
-  return listAsany()
-    .map((asana) => {
-      const naglowek = asana.sanskryt ? `${asana.nazwa} (${asana.sanskryt})` : asana.nazwa;
-      const czasy = POZIOMY.map((poziom) => `${poziom} ${asana.czasy_trzymania_oddechy[poziom]}`).join(" / ");
-      const linie = [
-        `- ${naglowek} — typ: ${asana.typ}, minimalna kondycja: ${asana.poziom_min}, oddechy w trzymaniu: ${czasy}`,
-        `  wejście: ${asana.skrypty.wejscie}`,
-      ];
-      if (asana.skrypty.trzymanie) linie.push(`  w trzymaniu: ${asana.skrypty.trzymanie}`);
-      if (asana.skrypty.wyjscie) linie.push(`  wyjście: ${asana.skrypty.wyjscie}`);
-      if (asana.skrypty.modyfikacja_lagodna) linie.push(`  łagodniej: ${asana.skrypty.modyfikacja_lagodna}`);
-      return linie.join("\n");
-    })
+//
+// Bez argumentu renderuje pełny rejestr (zachowanie sprzed filtra) — z tego
+// korzysta prompt budowany raz przy starcie, dla providerów bez pamięci.
+function renderAsana({ asana, gentleOnly, reason }) {
+  const header = asana.sanskryt ? `${asana.nazwa} (${asana.sanskryt})` : asana.nazwa;
+  const breaths = POZIOMY.map((poziom) => `${poziom} ${asana.czasy_trzymania_oddechy[poziom]}`).join(" / ");
+  const lines = [
+    `- ${header} — typ: ${asana.typ}, minimalna kondycja: ${asana.poziom_min}, oddechy w trzymaniu: ${breaths}`,
+  ];
+  // Wariant łagodny ZASTĘPUJE pełny opis, nie dopełnia go. Gdyby oba trafiły
+  // do promptu, model miałby do wyboru wersję pełną i złagodzoną — a wybór
+  // między nimi jest właśnie tym, czego mu tutaj nie oddajemy.
+  if (gentleOnly) {
+    lines.push(`  WYŁĄCZNIE w wersji złagodzonej (użytkownik zgłasza dolegliwość: ${reason}): ${asana.skrypty.modyfikacja_lagodna}`);
+    return lines.join("\n");
+  }
+  lines.push(`  wejście: ${asana.skrypty.wejscie}`);
+  if (asana.skrypty.trzymanie) lines.push(`  w trzymaniu: ${asana.skrypty.trzymanie}`);
+  if (asana.skrypty.wyjscie) lines.push(`  wyjście: ${asana.skrypty.wyjscie}`);
+  if (asana.skrypty.modyfikacja_lagodna) lines.push(`  łagodniej: ${asana.skrypty.modyfikacja_lagodna}`);
+  return lines.join("\n");
+}
+
+function asanyDoPromptu(filterResult = null) {
+  const entries = filterResult
+    ? filterResult.available
+    : listAsany().map((asana) => ({ asana, gentleOnly: false, reason: null }));
+  return entries.map(renderAsana).join("\n");
+}
+
+// Lista wykluczonych trafia do promptu razem z powodem — model NIE MOŻE
+// udawać, że taka pozycja nie istnieje. Gdy użytkownik sam o nią poprosi,
+// milczenie albo "nie znam takiej" brzmi jak awaria aplikacji; łagodna odmowa
+// z podaniem powodu brzmi jak trener.
+function excludedAsanasToPrompt(filterResult) {
+  return (filterResult?.excluded || [])
+    .map(({ asana, reason }) => `- ${asana.nazwa} — zgłoszona dolegliwość: ${reason}`)
     .join("\n");
 }
 
-module.exports = { listAsany, getAsana, getAsanyDoDetekcji, asanyDoPromptu, TYPY, POZIOMY };
+module.exports = {
+  listAsany,
+  getAsana,
+  getAsanyDoDetekcji,
+  asanyDoPromptu,
+  filterAsanas,
+  excludedAsanasToPrompt,
+  TYPY,
+  POZIOMY,
+};
